@@ -9,8 +9,16 @@ project(nanos3reader VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-option(NANOS3READER_BUILD_TESTS    "Build tests (SigV4 known-answer test)" ON)
-option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ON)
+# True only when nanos3reader is the top-level project (not pulled into another build via add_subdirectory
+# / FetchContent). Used to default tests/examples off and to skip install/export rules for embedders.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(NANOS3READER_TOP_LEVEL ON)
+else()
+    set(NANOS3READER_TOP_LEVEL OFF)
+endif()
+
+option(NANOS3READER_BUILD_TESTS    "Build tests (SigV4 known-answer test)" ${NANOS3READER_TOP_LEVEL})
+option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ${NANOS3READER_TOP_LEVEL})
 set(NANOS3READER_CRYPTO "openssl" CACHE STRING
     "SigV4 SHA-256 backend: openssl (default, links libcrypto) | bundled (in-tree, no crypto link)")
 
@@ -53,23 +61,27 @@ if(NANOS3READER_BUILD_TESTS)
 endif()
 
 # --- install / find_package(nanos3reader) -------------------------------------------------------
-install(TARGETS nanos3reader EXPORT nanos3readerTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(EXPORT nanos3readerTargets
-        FILE nanos3readerTargets.cmake
-        NAMESPACE nanos3reader::
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nanos3reader)
+# Only when standalone — an embedder (FetchContent/add_subdirectory) shouldn't have nanos3reader's install
+# and export rules folded into its own install.
+if(NANOS3READER_TOP_LEVEL)
+    install(TARGETS nanos3reader EXPORT nanos3readerTargets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(EXPORT nanos3readerTargets
+            FILE nanos3readerTargets.cmake
+            NAMESPACE nanos3reader::
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nanos3reader)
 
-configure_package_config_file(
-    cmake/nanos3readerConfig.cmake.in
-    "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfig.cmake"
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nanos3reader)
-write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfigVersion.cmake"
-    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfig.cmake"
-    "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfigVersion.cmake"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nanos3reader)
+    configure_package_config_file(
+        cmake/nanos3readerConfig.cmake.in
+        "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfig.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nanos3reader)
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfigVersion.cmake"
+        VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/nanos3readerConfigVersion.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nanos3reader)
+endif()
