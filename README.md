@@ -70,6 +70,50 @@ find_package(nanos3reader REQUIRED)
 target_link_libraries(your_app PRIVATE nanos3reader::nanos3reader)
 ```
 
+## C / FFI API
+
+For use from C — or any language that can call C (Python, Rust, Go, …) — there is a thin C wrapper in
+`include/nanos3reader/nanos3reader.h` that mirrors the C++ factory+stream model. It's built into the same
+library (toggle with `-DNANOS3READER_BUILD_C_API=ON|OFF`, default on):
+
+```c
+#include "nanos3reader/nanos3reader.h"
+
+nanos3reader_factory* f = nanos3reader_factory_create();   /* resolves creds/region/endpoint once; reuse it */
+nanos3reader_stream*  s = nanos3reader_open(f, "s3://bucket/key", 1 << 16);
+if (!s) { /* nanos3reader_last_error() explains why */ }
+
+char buf[65536];
+int64_t n = nanos3reader_pread(s, buf, sizeof buf, 1024);  /* random access: seek+read; n<0 on error */
+
+nanos3reader_close(s);
+nanos3reader_factory_destroy(f);
+```
+
+`read`/`pread` return bytes read, `0` at end-of-object, `-1` on error; `nanos3reader_last_error()` returns
+the reason (thread-local). A stream owns one keep-alive connection and is **not** safe to share across
+threads — give each thread its own stream; the factory may be shared once its credentials are resolved.
+
+`examples/s3cat_c.c` is the C counterpart of `s3cat` and a throughput probe — it streams an object to stdout
+one chunk at a time and prints MiB/s, which is a quick way to confirm the C layer adds no overhead:
+
+```bash
+AWS_ENDPOINT_URL=http://localhost:9000 ./build/s3cat_c s3://bucket/key 1048576 > /dev/null
+# stderr: read 1048576 bytes in 1048576-byte chunks in 0.0xx s (xxx.x MiB/s)
+```
+
+Binding from other languages is a direct FFI to those six functions — e.g. Python:
+
+```python
+import ctypes
+lib = ctypes.CDLL("libnanos3reader.so")
+lib.nanos3reader_open.restype  = ctypes.c_void_p
+lib.nanos3reader_open.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+lib.nanos3reader_pread.restype  = ctypes.c_int64
+lib.nanos3reader_pread.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint64]
+# nanos3reader_factory_create / _read / _seek / _tell / _close / _factory_destroy / _last_error similarly
+```
+
 ### Configuration (environment)
 
 | Variable | Purpose |

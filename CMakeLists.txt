@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nanos3reader VERSION 0.1.0 LANGUAGES CXX)
+project(nanos3reader VERSION 0.1.0 LANGUAGES CXX C)  # C for the C-API example/test (the C-API impl is C++)
 
 # ---------------------------------------------------------------------------------------------------
 # nanos3reader — a minimal, read-only S3 range reader (seekable std::istream over HTTP(S) range GETs +
@@ -23,12 +23,23 @@ option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ${NAN
 # default. When built it still self-skips at run time unless NANOS3READER_IT_URI / _EXPECT are set.
 option(NANOS3READER_BUILD_INTEGRATION_TESTS
     "Build the MinIO integration test (requires a live S3-compatible endpoint at run time)" OFF)
+option(NANOS3READER_BUILD_C_API "Build the C/FFI API (nanos3reader_open/read/close)" ON)
 set(NANOS3READER_CRYPTO "openssl" CACHE STRING
     "SigV4 SHA-256 backend: openssl (default, links libcrypto) | bundled (in-tree, no crypto link)")
 
 # --- the library --------------------------------------------------------------------------------
 add_library(nanos3reader src/s3_reader.cpp)
 add_library(nanos3reader::nanos3reader ALIAS nanos3reader)
+
+# C/FFI shim. It's a C++ TU compiled into the same library so the C symbols ship alongside the C++ ones.
+if(NANOS3READER_BUILD_C_API)
+    target_sources(nanos3reader PRIVATE src/s3_reader_c.cpp)
+    # Mark the build side so the export macro emits dllexport (vs dllimport) on shared Windows builds.
+    target_compile_definitions(nanos3reader PRIVATE NANOS3READER_BUILDING)
+    if(BUILD_SHARED_LIBS)
+        target_compile_definitions(nanos3reader PUBLIC NANOS3READER_SHARED)
+    endif()
+endif()
 
 target_compile_features(nanos3reader PUBLIC cxx_std_17)
 target_include_directories(nanos3reader PUBLIC
@@ -54,6 +65,14 @@ endif()
 if(NANOS3READER_BUILD_EXAMPLES)
     add_executable(s3cat examples/s3cat.cpp)
     target_link_libraries(s3cat PRIVATE nanos3reader::nanos3reader)
+
+    # s3cat_c: the C-API counterpart / FFI throughput probe (plain C linking only nanos3reader_*()).
+    if(NANOS3READER_BUILD_C_API)
+        add_executable(s3cat_c examples/s3cat_c.c)
+        target_link_libraries(s3cat_c PRIVATE nanos3reader::nanos3reader)
+        # Link with the C++ driver so libstdc++ (the static lib's runtime) is pulled in.
+        set_target_properties(s3cat_c PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
 endif()
 
 # --- tests --------------------------------------------------------------------------------------
@@ -62,6 +81,15 @@ if(NANOS3READER_BUILD_TESTS)
     add_executable(nanos3reader_sigv4_test tests/sigv4_test.cpp)
     target_link_libraries(nanos3reader_sigv4_test PRIVATE nanos3reader::nanos3reader)
     add_test(NAME sigv4 COMMAND nanos3reader_sigv4_test)
+
+    # C-API smoke test, compiled as C: guards the public C header against C++-isms and exercises the error
+    # path with no network.
+    if(NANOS3READER_BUILD_C_API)
+        add_executable(nanos3reader_c_api_test tests/c_api_test.c)
+        target_link_libraries(nanos3reader_c_api_test PRIVATE nanos3reader::nanos3reader)
+        set_target_properties(nanos3reader_c_api_test PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME c_api COMMAND nanos3reader_c_api_test)
+    endif()
 
     # MinIO integration test: a full end-to-end read against a live S3-compatible store. It exits 77 (and
     # CMake marks it skipped) unless NANOS3READER_IT_URI / NANOS3READER_IT_EXPECT are set in the environment.

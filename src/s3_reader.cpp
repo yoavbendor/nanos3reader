@@ -1070,6 +1070,8 @@ S3MinStreamFactory::S3MinStreamFactory() {
     config_ = cfg;
 }
 
+std::string last_error() { return g_last_error; }
+
 std::string S3MinStreamFactory::error() const { return g_last_error; }
 
 std::unique_ptr<std::istream> S3MinStreamFactory::open(const std::string& uri, std::size_t read_ahead_bytes) {

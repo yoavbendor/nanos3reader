@@ -66,6 +66,11 @@ std::string build_authorization(const CanonicalRequest& req, const std::string& 
 
 }  // namespace s3v4
 
+// Thread-local description of the most recent failed open()/read()/seek() on the calling thread, or "" if
+// none. This is the same message S3MinStreamFactory::error() returns; exposed as a free function so the C
+// API (and stream-level read/seek failures, which have no factory in hand) can surface it too.
+std::string last_error();
+
 // --- Stream factory --------------------------------------------------------------------------------
 
 // Opens s3:// objects as seekable, read-ahead-buffered std::istreams backed by libcurl range GETs + SigV4.

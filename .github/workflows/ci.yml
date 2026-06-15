@@ -77,6 +77,13 @@ jobs:
           NANOS3READER_IT_MISSING: s3://nanos3reader-it/data/does-not-exist.bin
         run: ctest --test-dir build --output-on-failure -R minio_integration
 
+      - name: C-API end-to-end + throughput (s3cat_c)
+        run: |
+          # Stream the object through the C API in 64 KiB chunks; the throughput line goes to stderr (visible
+          # in the log), and cmp proves the C wrapper returns byte-identical content.
+          ./build/s3cat_c "s3://${BUCKET}/data/obj.bin" 65536 > got.bin
+          cmp obj.bin got.bin && echo "s3cat_c output matches the source object"
+
       - name: MinIO logs (on failure)
         if: failure()
         run: docker logs minio || true
