@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -347,6 +348,13 @@ int curl_conn_debug(CURL*, curl_infotype type, char* data, std::size_t size, voi
         std::fprintf(stderr, "[nanos3reader] %s\n", line.c_str());
     }
     return 0;
+}
+
+// Background read-ahead prefetch is on by default; NANOS3READER_PREFETCH=0 forces the original
+// single-connection behavior.
+bool prefetch_default_on() {
+    const char* v = std::getenv("NANOS3READER_PREFETCH");
+    return !(v != nullptr && std::strcmp(v, "0") == 0);
 }
 
 // --- credential resolution (env -> shared profile files -> ECS -> EC2 IMDSv2) ----------------------
@@ -832,9 +840,23 @@ public:
         host_ = e.host;
         url_ = e.url;
         path_ = e.path;
+        pf_available_ = prefetch_default_on();
     }
 
     ~S3Streambuf() override {
+        if (pf_enabled_) {
+            {
+                std::lock_guard<std::mutex> lk(pf_mu_);
+                pf_stop_ = true;
+                pf_cv_.notify_all();
+            }
+            if (pf_thread_.joinable()) {
+                pf_thread_.join();  // bounded by the low-speed timeout if a prefetch GET is mid-flight
+            }
+        }
+        if (pf_curl_ != nullptr) {
+            curl_easy_cleanup(pf_curl_);
+        }
         if (curl_ != nullptr) {
             curl_easy_cleanup(curl_);
         }
@@ -851,12 +873,18 @@ protected:
             return traits_type::eof();
         }
         const std::uint64_t next = window_start_ + window_len_;
-        if (!load_window(next)) {
-            return traits_type::eof();
+        // Sequential read: take the prefetched window if it's the one we need, else fetch synchronously.
+        if (!take_prefetch(next)) {
+            if (!load_window(next)) {
+                return traits_type::eof();
+            }
         }
         if (window_len_ == 0) {
             reached_eof_ = true;
             return traits_type::eof();
+        }
+        if (!reached_eof_) {
+            start_prefetch(window_start_ + window_len_);  // read one window ahead on the 2nd connection
         }
         return traits_type::to_int_type(*gptr());
     }
@@ -887,6 +915,7 @@ protected:
         // The caller seeks before every read, so this is the start of a fresh logical fetch: drop any stale
         // error so a later error() reflects only this fetch.
         g_last_error.clear();
+        discard_prefetch();  // a seek breaks the sequential streak; drop any speculative read-ahead
         const std::uint64_t target = static_cast<std::uint64_t>(static_cast<off_type>(sp));
         // Inside the live window? Just move the get pointer — no GET.
         if (window_len_ > 0 && target >= window_start_ && target <= window_start_ + window_len_) {
@@ -932,25 +961,36 @@ private:
         setg(nullptr, nullptr, nullptr);
     }
 
-    // Fetch [start, start+read_ahead-1] into the window, with retry/backoff and one-shot region redirect.
-    // Returns false only on a real transport/HTTP error (sets the thread error); an empty/short read at
-    // end-of-object is a success that flags reached_eof_.
-    bool load_window(std::uint64_t start) {
-        if (curl_ == nullptr) {
-            fail("curl init failed");
-            return false;
+    // Result of one range fetch, kept apart from the window members so the prefetch thread can fetch into
+    // its own buffer without touching the consumer's window.
+    struct Fetched {
+        enum Status { kOk, kEof, kError };
+        Status status = kError;
+        bool partial = false;  // 206 vs 200 (meaningful only for kOk)
+        std::string error;     // populated for kError
+    };
+
+    // Perform GET [start, start+read_ahead-1] into `out` on `curl`, with retry/backoff. When `allow_redirect`
+    // is set, a wrong-region response re-targets the endpoint and retries — that mutates the shared endpoint
+    // members, so only the main thread passes true. Otherwise it touches no window state, so the prefetch
+    // thread can run it concurrently into its own buffer.
+    Fetched fetch_into(CURL* curl, std::uint64_t start, std::vector<char>& out, bool allow_redirect) {
+        Fetched f;
+        if (curl == nullptr) {
+            f.error = "curl init failed";
+            return f;
         }
         const Credentials cred = cfg_->creds->get();
         if (!cred.valid()) {
-            fail("missing AWS credentials — " + cfg_->creds->diagnostic());
-            return false;
+            f.error = "missing AWS credentials — " + cfg_->creds->diagnostic();
+            return f;
         }
         bool redirected = false;
         int attempt = 0;
         for (;;) {
-            window_.clear();
-            window_.reserve(read_ahead_);
-            region_header_.clear();
+            out.clear();
+            out.reserve(read_ahead_);
+            std::string region_header;
 
             const std::uint64_t last = start + read_ahead_ - 1;
             const std::string range = "bytes=" + std::to_string(start) + "-" + std::to_string(last);
@@ -983,36 +1023,36 @@ private:
             }
             hdrs = curl_slist_append(hdrs, ("Authorization: " + authz).c_str());
 
-            curl_easy_reset(curl_);  // preserves the live connection + DNS/TLS caches (keep-alive)
-            curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
-            curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L);
-            curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
-            curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, &write_to_vector);
-            curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &window_);
-            curl_easy_setopt(curl_, CURLOPT_HEADERFUNCTION, &capture_region_header);
-            curl_easy_setopt(curl_, CURLOPT_HEADERDATA, &region_header_);
-            curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 0L);
-            curl_easy_setopt(curl_, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
-            curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
-            curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_LIMIT, kLowSpeedBytes);
-            curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_TIME, kLowSpeedTimeSec);
+            curl_easy_reset(curl);  // preserves the live connection + DNS/TLS caches (keep-alive)
+            curl_easy_setopt(curl, CURLOPT_URL, url_.c_str());
+            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &write_to_vector);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &capture_region_header);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA, &region_header);
+            curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+            curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, kLowSpeedBytes);
+            curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, kLowSpeedTimeSec);
             if (conn_trace_enabled()) {  // curl_easy_reset cleared these, so (re)set per attempt
-                curl_easy_setopt(curl_, CURLOPT_VERBOSE, 1L);
-                curl_easy_setopt(curl_, CURLOPT_DEBUGFUNCTION, &curl_conn_debug);
+                curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+                curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, &curl_conn_debug);
             }
 
-            const CURLcode rc = curl_easy_perform(curl_);
+            const CURLcode rc = curl_easy_perform(curl);
             long code = 0;
-            curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
             if (conn_trace_enabled()) {
                 // CURLINFO_NUM_CONNECTS: new connections this transfer needed — 0 means the socket was reused.
                 long new_conns = -1;
                 long port = 0;
                 char* ip = nullptr;
-                curl_easy_getinfo(curl_, CURLINFO_NUM_CONNECTS, &new_conns);
-                curl_easy_getinfo(curl_, CURLINFO_PRIMARY_PORT, &port);
-                curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
+                curl_easy_getinfo(curl, CURLINFO_NUM_CONNECTS, &new_conns);
+                curl_easy_getinfo(curl, CURLINFO_PRIMARY_PORT, &port);
+                curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &ip);
                 std::fprintf(stderr,
                              "[nanos3reader] GET bytes=%llu-%llu http=%ld new_connections=%ld peer=%s:%ld\n",
                              static_cast<unsigned long long>(start), static_cast<unsigned long long>(last),
@@ -1021,24 +1061,21 @@ private:
             curl_slist_free_all(hdrs);
 
             if (rc == CURLE_OK && (code == 200 || code == 206)) {
-                install_window(start, code == 206);
-                g_last_error.clear();
-                return true;
+                f.status = Fetched::kOk;
+                f.partial = (code == 206);
+                return f;
             }
             if (rc == CURLE_OK && code == 416) {  // Range Not Satisfiable: at/over the end of the object.
-                window_start_ = start;
-                window_len_ = 0;
-                reached_eof_ = true;
-                setg(nullptr, nullptr, nullptr);
-                g_last_error.clear();
-                return true;
+                f.status = Fetched::kEof;
+                return f;
             }
 
             // Wrong-region redirect (virtual-hosted only): re-target to the region S3 reported and retry
-            // immediately (once), without consuming a backoff attempt.
-            if (rc == CURLE_OK && !cfg_->path_style && (code == 301 || code == 307 || code == 400) &&
-                !region_header_.empty() && region_header_ != region_ && !redirected) {
-                region_ = region_header_;
+            // immediately (once), without consuming a backoff attempt. Main thread only (mutates endpoint).
+            if (allow_redirect && rc == CURLE_OK && !cfg_->path_style &&
+                (code == 301 || code == 307 || code == 400) && !region_header.empty() &&
+                region_header != region_ && !redirected) {
+                region_ = region_header;
                 const Endpoint e = build_endpoint(*cfg_, bucket_, key_, region_);
                 host_ = e.host;
                 url_ = e.url;
@@ -1057,16 +1094,125 @@ private:
             }
 
             if (rc != CURLE_OK) {
-                fail(std::string("S3 GET transport error: ") + curl_easy_strerror(rc));
+                f.error = std::string("S3 GET transport error: ") + curl_easy_strerror(rc);
             } else {
-                std::string body(window_.begin(), window_.end());
+                std::string body(out.begin(), out.end());
                 if (body.size() > 512) {
                     body.resize(512);
                 }
-                fail("S3 GET HTTP " + std::to_string(code) + ": " + body);
+                f.error = "S3 GET HTTP " + std::to_string(code) + ": " + body;
             }
+            return f;
+        }
+    }
+
+    // Synchronous load of the window at `start` on the main connection (handles region redirect). An
+    // end-of-object response is a success that flags reached_eof_; a real error sets the thread error.
+    bool load_window(std::uint64_t start) {
+        const Fetched f = fetch_into(curl_, start, window_, /*allow_redirect=*/true);
+        return install_fetch(start, f);
+    }
+
+    // Turn a fetch result (whose bytes are already in window_) into the live window. False on a real error.
+    bool install_fetch(std::uint64_t start, const Fetched& f) {
+        if (f.status == Fetched::kError) {
+            fail(f.error);
             return false;
         }
+        if (f.status == Fetched::kEof) {
+            window_start_ = start;
+            window_len_ = 0;
+            reached_eof_ = true;
+            setg(nullptr, nullptr, nullptr);
+            g_last_error.clear();
+            return true;
+        }
+        install_window(start, f.partial);
+        g_last_error.clear();
+        return true;
+    }
+
+    // --- background prefetch (read one window ahead on a second connection) ----------------------------
+    // Engaged only during sequential streaming (requested from underflow, never from a seek), so random
+    // access never pays for a speculative GET. Disabled with NANOS3READER_PREFETCH=0.
+
+    void prefetch_worker() {
+        std::unique_lock<std::mutex> lk(pf_mu_);
+        for (;;) {
+            pf_cv_.wait(lk, [&] { return pf_stop_ || pf_state_ == PfState::kRunning; });
+            if (pf_stop_) {
+                return;
+            }
+            const std::uint64_t start = pf_start_;
+            lk.unlock();
+            std::vector<char> buf;
+            Fetched f = fetch_into(pf_curl_, start, buf, /*allow_redirect=*/false);
+            lk.lock();
+            pf_buf_.swap(buf);
+            pf_result_ = std::move(f);
+            pf_state_ = PfState::kDone;
+            pf_cv_.notify_all();
+        }
+    }
+
+    // Kick off a prefetch of the window at `start` (no-op if a fetch is already pending/ready). Lazily spins
+    // up the worker + its connection on first use, so single-window objects and seek-only access never make
+    // a second connection.
+    void start_prefetch(std::uint64_t start) {
+        if (!pf_available_) {
+            return;
+        }
+        if (!pf_enabled_) {
+            pf_curl_ = curl_easy_init();
+            if (pf_curl_ == nullptr) {
+                pf_available_ = false;
+                return;
+            }
+            pf_thread_ = std::thread(&S3Streambuf::prefetch_worker, this);
+            pf_enabled_ = true;
+        }
+        std::lock_guard<std::mutex> lk(pf_mu_);
+        if (pf_state_ != PfState::kIdle) {
+            return;
+        }
+        pf_start_ = start;
+        pf_state_ = PfState::kRunning;
+        pf_cv_.notify_all();
+    }
+
+    // If a prefetch for `want` is in flight or ready, wait for it and install it. Returns false (so the
+    // caller does a synchronous load) when there is none, it was for a different offset, or it failed.
+    bool take_prefetch(std::uint64_t want) {
+        if (!pf_enabled_) {
+            return false;
+        }
+        std::unique_lock<std::mutex> lk(pf_mu_);
+        if (pf_state_ == PfState::kIdle) {
+            return false;
+        }
+        pf_cv_.wait(lk, [&] { return pf_state_ == PfState::kDone; });
+        if (pf_start_ != want || pf_result_.status == Fetched::kError) {
+            pf_state_ = PfState::kIdle;  // stale (a seek moved us) or failed — fall back to a sync load
+            return false;
+        }
+        window_.swap(pf_buf_);
+        const Fetched f = pf_result_;
+        pf_state_ = PfState::kIdle;
+        lk.unlock();
+        return install_fetch(want, f);
+    }
+
+    // Wait out any in-flight prefetch and reset to idle — called on a seek, after which the next read is no
+    // longer the sequential successor of the current window.
+    void discard_prefetch() {
+        if (!pf_enabled_) {
+            return;
+        }
+        std::unique_lock<std::mutex> lk(pf_mu_);
+        if (pf_state_ == PfState::kRunning) {
+            pf_cv_.wait(lk, [&] { return pf_state_ == PfState::kDone; });
+        }
+        pf_state_ = PfState::kIdle;
     }
 
     std::shared_ptr<const s3detail::Config> cfg_;
@@ -1078,13 +1224,27 @@ private:
     std::string path_;  // percent-encoded canonical path
     std::size_t read_ahead_;
     CURL* curl_ = nullptr;
-    std::string region_header_;  // x-amz-bucket-region captured from the last response
 
     std::vector<char> window_;
     std::uint64_t window_start_ = 0;
     std::size_t window_len_ = 0;
     bool reached_eof_ = false;
     std::string last_error_;
+
+    // Background prefetch state (guarded by pf_mu_, except the main-thread-only pf_available_/pf_enabled_/
+    // pf_curl_/pf_thread_ which are created lazily on the consumer thread).
+    bool pf_available_ = false;  // env permits it (handle made lazily)
+    bool pf_enabled_ = false;    // worker + 2nd connection are live
+    CURL* pf_curl_ = nullptr;
+    std::thread pf_thread_;
+    std::mutex pf_mu_;
+    std::condition_variable pf_cv_;
+    enum class PfState { kIdle, kRunning, kDone };
+    PfState pf_state_ = PfState::kIdle;
+    bool pf_stop_ = false;
+    std::uint64_t pf_start_ = 0;
+    std::vector<char> pf_buf_;
+    Fetched pf_result_;
 };
 
 // istream that owns its streambuf so the unique_ptr<istream> the factory returns keeps the buffer alive.

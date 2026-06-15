@@ -49,6 +49,11 @@ target_include_directories(nanos3reader PUBLIC
 find_package(CURL REQUIRED)
 target_link_libraries(nanos3reader PRIVATE CURL::libcurl)
 
+# The reader's background read-ahead uses std::thread, which needs the platform threads library.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(nanos3reader PRIVATE Threads::Threads)
+
 # SigV4 crypto backend. "openssl" links libcrypto for SHA-256; "bundled" uses the in-tree SHA-256 so the
 # library links no crypto library of its own (handy for small static builds where libcurl supplies TLS via
 # mbedTLS/BearSSL/etc — see README "Small static builds").

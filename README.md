@@ -28,7 +28,9 @@ connection per object, so streaming many small ranges from a few objects is fast
 ## Features
 
 - Seekable `std::istream` over S3 range `GET`s, with read-ahead buffering and **one keep-alive
-  connection reused per object**.
+  connection reused per object**. During sequential streaming it also **prefetches the next window on a
+  second connection** so transfer overlaps consumption (set `NANOS3READER_PREFETCH=0` to keep a single
+  connection).
 - **AWS SigV4** signing (validated against AWS's published test vectors — see `tests/sigv4_test.cpp`).
 - **Full credential chain**, the way the AWS tools resolve it:
   environment → shared profile files (`~/.aws/credentials` + `~/.aws/config`, honoring `AWS_PROFILE`,
@@ -124,6 +126,7 @@ lib.nanos3reader_pread.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_si
 | `AWS_ENDPOINT_URL` | Custom endpoint (MinIO etc.); switches to path-style addressing. |
 | `AWS_MAX_ATTEMPTS` | Tries per range GET (default 3; full-jitter backoff on transient failures). |
 | `NANOS3READER_TRACE_CONN` | Set to `1` to log every connection open/reuse/close and a per-GET `new_connections` count to stderr — use it to confirm the keep-alive connection is reused across range GETs. |
+| `NANOS3READER_PREFETCH` | Set to `0` to disable the background read-ahead prefetch (keeps one connection per object). On by default; engaged only during sequential streaming, so random access never issues a speculative GET. |
 
 ## SigV4 crypto backend
 
