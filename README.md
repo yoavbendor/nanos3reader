@@ -123,6 +123,7 @@ lib.nanos3reader_pread.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_si
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing (else the profile's `region`, else `us-east-1`). |
 | `AWS_ENDPOINT_URL` | Custom endpoint (MinIO etc.); switches to path-style addressing. |
 | `AWS_MAX_ATTEMPTS` | Tries per range GET (default 3; full-jitter backoff on transient failures). |
+| `NANOS3READER_TRACE_CONN` | Set to `1` to log every connection open/reuse/close and a per-GET `new_connections` count to stderr — use it to confirm the keep-alive connection is reused across range GETs. |
 
 ## SigV4 crypto backend
 

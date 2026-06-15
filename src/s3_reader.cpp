@@ -318,6 +318,37 @@ std::size_t write_to_string(char* ptr, std::size_t size, std::size_t nmemb, void
     return n;
 }
 
+// Opt-in connection tracing (set NANOS3READER_TRACE_CONN=1) to verify keep-alive reuse: prints curl's own
+// connect/reuse/close lifecycle lines plus a per-GET new-connection count to stderr. Evaluated once.
+bool conn_trace_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NANOS3READER_TRACE_CONN");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+// curl debug callback: forward only connection-lifecycle informational lines, so the trace shows exactly
+// when a socket is opened, reused, or closed (the signal for whether the session stays alive across GETs).
+int curl_conn_debug(CURL*, curl_infotype type, char* data, std::size_t size, void*) {
+    if (type != CURLINFO_TEXT) {
+        return 0;
+    }
+    std::string line(data, size);
+    const bool interesting =
+        line.find("Connected to") != std::string::npos || line.find("Trying ") != std::string::npos ||
+        line.find("e-using") != std::string::npos ||  // "Re-using existing connection"
+        line.find("onnection #") != std::string::npos ||  // "Closing connection #0", "Connection #0 ... intact"
+        line.find("Closing connection") != std::string::npos;
+    if (interesting) {
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+            line.pop_back();
+        }
+        std::fprintf(stderr, "[nanos3reader] %s\n", line.c_str());
+    }
+    return 0;
+}
+
 // --- credential resolution (env -> shared profile files -> ECS -> EC2 IMDSv2) ----------------------
 
 struct Credentials {
@@ -966,10 +997,27 @@ private:
             curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
             curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_LIMIT, kLowSpeedBytes);
             curl_easy_setopt(curl_, CURLOPT_LOW_SPEED_TIME, kLowSpeedTimeSec);
+            if (conn_trace_enabled()) {  // curl_easy_reset cleared these, so (re)set per attempt
+                curl_easy_setopt(curl_, CURLOPT_VERBOSE, 1L);
+                curl_easy_setopt(curl_, CURLOPT_DEBUGFUNCTION, &curl_conn_debug);
+            }
 
             const CURLcode rc = curl_easy_perform(curl_);
             long code = 0;
             curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
+            if (conn_trace_enabled()) {
+                // CURLINFO_NUM_CONNECTS: new connections this transfer needed — 0 means the socket was reused.
+                long new_conns = -1;
+                long port = 0;
+                char* ip = nullptr;
+                curl_easy_getinfo(curl_, CURLINFO_NUM_CONNECTS, &new_conns);
+                curl_easy_getinfo(curl_, CURLINFO_PRIMARY_PORT, &port);
+                curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
+                std::fprintf(stderr,
+                             "[nanos3reader] GET bytes=%llu-%llu http=%ld new_connections=%ld peer=%s:%ld\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(last),
+                             code, new_conns, ip != nullptr ? ip : "?", port);
+            }
             curl_slist_free_all(hdrs);
 
             if (rc == CURLE_OK && (code == 200 || code == 206)) {
