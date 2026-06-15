@@ -48,6 +48,21 @@ ctest --test-dir build            # runs the SigV4 known-answer test (no network
 ./build/s3cat s3://bucket/key | head -c 100 | xxd
 ```
 
+The end-to-end read path (range GETs, read-ahead refetches, seeking, EOF, path-style addressing) is
+covered by an integration test against a live S3-compatible store. CI runs it against MinIO; to run it
+yourself, build with `-DNANOS3READER_BUILD_INTEGRATION_TESTS=ON` and point it at an object you've
+uploaded:
+
+```bash
+cmake -S . -B build -DNANOS3READER_BUILD_INTEGRATION_TESTS=ON && cmake --build build -j
+AWS_ENDPOINT_URL=http://localhost:9000 \
+NANOS3READER_IT_URI=s3://bucket/key NANOS3READER_IT_EXPECT=/path/to/local/copy \
+  ctest --test-dir build -R minio_integration --output-on-failure
+```
+
+Without `NANOS3READER_IT_URI` / `NANOS3READER_IT_EXPECT` the test reports as *skipped*, so a plain
+`ctest` never needs a network.
+
 Consume it from your own CMake:
 
 ```cmake

@@ -27,3 +27,56 @@ jobs:
 
       - name: Test (SigV4 known-answer, no network)
         run: ctest --test-dir build --output-on-failure
+
+  integration:
+    runs-on: ubuntu-latest
+    name: minio-integration
+    env:
+      # MinIO root creds double as the AWS credentials the reader resolves from the environment.
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localhost:9000
+      BUCKET: nanos3reader-it
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libcurl4-openssl-dev libssl-dev
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e "MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID}" \
+            -e "MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY}" \
+            minio/minio:latest server /data
+          # Wait for the S3 endpoint to report ready before seeding it.
+          for i in $(seq 1 30); do
+            if curl -fsS "${AWS_ENDPOINT_URL}/minio/health/ready"; then echo "minio ready"; break; fi
+            sleep 1
+          done
+
+      - name: Seed test object
+        run: |
+          # ~1 MiB of random bytes so a small read-ahead spans many windows. The reader is checked against
+          # this exact local copy, so the content need not be deterministic.
+          head -c 1048576 /dev/urandom > obj.bin
+          aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 mb "s3://${BUCKET}"
+          aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp obj.bin "s3://${BUCKET}/data/obj.bin"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNANOS3READER_BUILD_INTEGRATION_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test (MinIO integration, real range GETs)
+        env:
+          NANOS3READER_IT_URI: s3://nanos3reader-it/data/obj.bin
+          NANOS3READER_IT_EXPECT: ${{ github.workspace }}/obj.bin
+          NANOS3READER_IT_MISSING: s3://nanos3reader-it/data/does-not-exist.bin
+        run: ctest --test-dir build --output-on-failure -R minio_integration
+
+      - name: MinIO logs (on failure)
+        if: failure()
+        run: docker logs minio || true

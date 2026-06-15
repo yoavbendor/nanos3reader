@@ -19,6 +19,10 @@ endif()
 
 option(NANOS3READER_BUILD_TESTS    "Build tests (SigV4 known-answer test)" ${NANOS3READER_TOP_LEVEL})
 option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ${NANOS3READER_TOP_LEVEL})
+# The MinIO integration test needs a live S3-compatible endpoint (CI spins one up), so it is off by
+# default. When built it still self-skips at run time unless NANOS3READER_IT_URI / _EXPECT are set.
+option(NANOS3READER_BUILD_INTEGRATION_TESTS
+    "Build the MinIO integration test (requires a live S3-compatible endpoint at run time)" OFF)
 set(NANOS3READER_CRYPTO "openssl" CACHE STRING
     "SigV4 SHA-256 backend: openssl (default, links libcrypto) | bundled (in-tree, no crypto link)")
 
@@ -58,6 +62,15 @@ if(NANOS3READER_BUILD_TESTS)
     add_executable(nanos3reader_sigv4_test tests/sigv4_test.cpp)
     target_link_libraries(nanos3reader_sigv4_test PRIVATE nanos3reader::nanos3reader)
     add_test(NAME sigv4 COMMAND nanos3reader_sigv4_test)
+
+    # MinIO integration test: a full end-to-end read against a live S3-compatible store. It exits 77 (and
+    # CMake marks it skipped) unless NANOS3READER_IT_URI / NANOS3READER_IT_EXPECT are set in the environment.
+    if(NANOS3READER_BUILD_INTEGRATION_TESTS)
+        add_executable(nanos3reader_minio_test tests/minio_integration_test.cpp)
+        target_link_libraries(nanos3reader_minio_test PRIVATE nanos3reader::nanos3reader)
+        add_test(NAME minio_integration COMMAND nanos3reader_minio_test)
+        set_tests_properties(minio_integration PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
 
 # --- install / find_package(nanos3reader) -------------------------------------------------------
