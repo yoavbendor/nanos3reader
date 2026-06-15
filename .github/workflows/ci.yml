@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crypto: [openssl, bundled]
+    name: build+sigv4 (crypto=${{ matrix.crypto }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libcurl4-openssl-dev libssl-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNANOS3READER_CRYPTO=${{ matrix.crypto }}
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test (SigV4 known-answer, no network)
+        run: ctest --test-dir build --output-on-failure
