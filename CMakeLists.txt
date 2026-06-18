@@ -17,6 +17,13 @@ else()
     set(NANOS3READER_TOP_LEVEL OFF)
 endif()
 
+# Export a compile DB for clangd / IDE indexing on a standalone build (compile_commands.json is already
+# gitignored). Skipped when embedded so we don't override an embedder's choice. (All real deps come from
+# find_package(CURL/OpenSSL), so there's no FetchContent base dir to relocate here.)
+if(NANOS3READER_TOP_LEVEL)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
 option(NANOS3READER_BUILD_TESTS    "Build tests (SigV4 known-answer test)" ${NANOS3READER_TOP_LEVEL})
 option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ${NANOS3READER_TOP_LEVEL})
 # The MinIO integration test needs a live S3-compatible endpoint (CI spins one up), so it is off by
