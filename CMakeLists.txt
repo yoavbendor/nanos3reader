@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nanos3reader VERSION 0.1.0 LANGUAGES CXX)
+project(nanos3reader VERSION 0.2.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------------------------------
 # nanos3reader — a minimal, read-only S3 range reader (seekable std::istream over HTTP(S) range GETs +
