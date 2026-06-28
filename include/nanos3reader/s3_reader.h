@@ -12,6 +12,7 @@
 #define NANOS3READER_S3_READER_H
 
 #include <cstddef>
+#include <cstdint>
 #include <istream>
 #include <memory>
 #include <string>
@@ -88,6 +89,21 @@ public:
 private:
     std::shared_ptr<const s3detail::Config> config_;
 };
+
+// --- Disk-resident LRU block cache -----------------------------------------------------------------
+
+// Optional process-global cache that persists fetched, read-ahead-aligned blocks as flat files on local
+// disk, so a re-read of any offset within a previously fetched block is served from disk (sub-millisecond)
+// instead of issuing a fresh range GET. It applies only to s3:// reads; file:// streams don't go through
+// this code. Disabled by default.
+//
+// Configure once before the first open(). cache_dir is created if absent. max_blocks is the LRU capacity,
+// clamped to 2..500; max_blocks <= 0 disables the cache. Returns true on success (false only if cache_dir
+// can't be created). Thread-safe.
+bool configure_disk_cache(const std::string& cache_dir, int max_blocks);
+
+// Cumulative block-level hit/miss counters since process start (pass nullptr to skip either).
+void disk_cache_stats(std::uint64_t* out_hits, std::uint64_t* out_misses);
 
 }  // namespace nanos3reader
 
