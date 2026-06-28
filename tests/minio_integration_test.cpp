@@ -19,11 +19,14 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
+
+#include <unistd.h>
 
 namespace {
 
@@ -167,6 +170,47 @@ int main() {
             s->read(buf, sizeof buf);
             if (s->gcount() != 0) fail("read of missing key returned data");
             if (s->good()) fail("stream still good() after reading a missing key");
+        }
+    }
+
+    // 6. Disk LRU block cache: the first full read is all misses (and populates the cache on disk); a
+    //    second full read of the same object is served from disk (hits increase) and returns identical
+    //    bytes. The read-ahead is small enough that the object spans several blocks.
+    {
+        const std::filesystem::path cache_dir =
+            std::filesystem::temp_directory_path() / ("nanos3reader-it-cache-" + std::to_string(::getpid()));
+        std::error_code ec;
+        std::filesystem::remove_all(cache_dir, ec);  // start clean even if a prior run left files
+        if (!nanos3reader::configure_disk_cache(cache_dir.string(), 100)) {
+            fail("configure_disk_cache failed for " + cache_dir.string());
+        } else {
+            const std::size_t read_ahead = 64 * 1024;
+
+            std::uint64_t h0 = 0, m0 = 0;
+            nanos3reader::disk_cache_stats(&h0, &m0);
+            {
+                auto s = factory.open(uri, read_ahead);
+                std::ostringstream got;
+                if (s) got << s->rdbuf();
+                if (!s || got.str() != expected) fail("cached read #1 (cold) mismatch");
+            }
+            std::uint64_t h1 = 0, m1 = 0;
+            nanos3reader::disk_cache_stats(&h1, &m1);
+            if (m1 <= m0) fail("expected cache misses on the cold read");
+
+            {
+                auto s = factory.open(uri, read_ahead);
+                std::ostringstream got;
+                if (s) got << s->rdbuf();
+                if (!s || got.str() != expected) fail("cached read #2 (warm) mismatch");
+            }
+            std::uint64_t h2 = 0, m2 = 0;
+            nanos3reader::disk_cache_stats(&h2, &m2);
+            if (h2 <= h1) fail("expected cache hits on the warm read");
+
+            // Disable the cache again so it doesn't leak into any later additions to this test.
+            nanos3reader::configure_disk_cache("", 0);
+            std::filesystem::remove_all(cache_dir, ec);
         }
     }
 

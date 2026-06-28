@@ -38,6 +38,8 @@ connection per object, so streaming many small ranges from a few objects is fast
 - **Self-explaining failures**: when no credentials are found, the error names every source it tried and
   why.
 - **S3-compatible stores**: set `AWS_ENDPOINT_URL` (e.g. `http://localhost:9000`) for path-style MinIO/etc.
+- **Optional disk block cache**: persist fetched blocks to local disk so re-reads skip the network
+  entirely (see *Disk block cache* below).
 
 ## Build & use
 
@@ -79,6 +81,32 @@ target_link_libraries(your_app PRIVATE nanos3reader::nanos3reader)
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing (else the profile's `region`, else `us-east-1`). |
 | `AWS_ENDPOINT_URL` | Custom endpoint (MinIO etc.); switches to path-style addressing. |
 | `AWS_MAX_ATTEMPTS` | Tries per range GET (default 3; full-jitter backoff on transient failures). |
+
+## Disk block cache
+
+An optional, process-global **LRU cache on local disk**. When enabled, each fetched read-ahead-aligned
+block is written to a flat file (`<uri-hash>_<offset>.blk`) under a cache directory; a later read of any
+offset within a cached block is served from disk (sub-millisecond) instead of issuing a range `GET`. This
+turns a repeated read of the same object — across `open()` calls or process runs — into local disk I/O.
+It applies to `s3://` reads only and is **disabled by default**.
+
+```cpp
+#include "nanos3reader/s3_reader.h"
+
+// Configure once before the first open(). max_blocks is the LRU capacity (clamped to 2..500);
+// <= 0 disables the cache. Each block is one read-ahead window on disk.
+nanos3reader::configure_disk_cache("/var/tmp/n3r-cache", /*max_blocks=*/100);
+
+nanos3reader::S3MinStreamFactory factory;
+auto stream = factory.open("s3://my-bucket/object", /*read_ahead=*/32 << 20);
+// ... reads now populate (and on re-read, hit) the cache ...
+
+std::uint64_t hits = 0, misses = 0;
+nanos3reader::disk_cache_stats(&hits, &misses);
+```
+
+The LRU is mtime-based: a hit promotes its block, and a store evicts the oldest block once the directory
+exceeds `max_blocks`. The cache directory is the caller's to manage (e.g. remove it on shutdown).
 
 ## SigV4 crypto backend
 

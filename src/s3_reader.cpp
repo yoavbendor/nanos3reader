@@ -4,6 +4,7 @@
 #include "nanos3reader/s3_reader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -786,15 +788,170 @@ void sleep_backoff(int attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(dist(rng)));
 }
 
+// --- disk-resident LRU block cache -----------------------------------------------------------------
+// Process-global, opt-in. Persists fetched read-ahead-aligned blocks as flat files so a re-read of any
+// offset inside a previously fetched block is served from local disk instead of a fresh range GET. The
+// LRU is mtime-based: a hit touches the file's mtime (most-recently-used), and a store evicts the file
+// with the oldest mtime once the directory exceeds the capacity. N <= 500, so the O(N) eviction scan is
+// cheap. File I/O and eviction run under one mutex; the enabled() check on the hot path is lock-free.
+
+class DiskCache {
+public:
+    bool configure(const std::string& dir, int max_blocks) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (max_blocks <= 0) {
+            enabled_.store(false, std::memory_order_relaxed);
+            return true;
+        }
+        max_blocks = std::clamp(max_blocks, 2, 500);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            enabled_.store(false, std::memory_order_relaxed);
+            return false;
+        }
+        dir_ = dir;
+        max_blocks_ = max_blocks;
+        enabled_.store(true, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool enabled() const { return enabled_.load(std::memory_order_relaxed); }
+
+    void stats(std::uint64_t* out_hits, std::uint64_t* out_misses) const {
+        if (out_hits != nullptr) {
+            *out_hits = hits_.load(std::memory_order_relaxed);
+        }
+        if (out_misses != nullptr) {
+            *out_misses = misses_.load(std::memory_order_relaxed);
+        }
+    }
+
+    // On a hit: read the block into `out`, promote it (mtime -> now), count the hit, return true.
+    // On a miss: count the miss, return false (the caller then fetches from S3 and calls store()).
+    bool try_load(const std::string& uri, std::uint64_t chunk_start, std::vector<char>& out) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const std::filesystem::path path = path_for(uri, chunk_start);
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(path, ec);
+        if (ec) {  // missing or unstattable -> miss
+            misses_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            misses_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        out.resize(static_cast<std::size_t>(size));
+        if (size > 0 && !in.read(out.data(), static_cast<std::streamsize>(size))) {
+            misses_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
+        hits_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Write `data` as the block for (uri, chunk_start), then evict the oldest blocks past capacity. The
+    // block is written to a temp file and renamed into place so a crash never leaves a torn block behind.
+    void store(const std::string& uri, std::uint64_t chunk_start, const std::vector<char>& data) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const std::filesystem::path path = path_for(uri, chunk_start);
+        const std::filesystem::path tmp = path.string() + ".tmp";
+        {
+            std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+            if (!o) {
+                return;  // cache write is best-effort; a failure just means a future miss
+            }
+            if (!data.empty()) {
+                o.write(data.data(), static_cast<std::streamsize>(data.size()));
+            }
+            if (!o) {
+                o.close();
+                std::error_code ec;
+                std::filesystem::remove(tmp, ec);
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);
+            return;
+        }
+        evict_if_needed();
+    }
+
+private:
+    std::filesystem::path path_for(const std::string& uri, std::uint64_t chunk_start) const {
+        std::uint64_t h = 5381;
+        for (unsigned char c : uri) {
+            h = ((h << 5) + h) + c;  // djb2
+        }
+        return std::filesystem::path(dir_) / (hex16(h) + "_" + hex16(chunk_start) + ".blk");
+    }
+
+    static std::string hex16(std::uint64_t v) {
+        static const char* const kHex = "0123456789abcdef";
+        std::string s(16, '0');
+        for (int i = 15; i >= 0; --i) {
+            s[i] = kHex[v & 0xF];
+            v >>= 4;
+        }
+        return s;
+    }
+
+    // Called with mu_ held. Deletes the oldest-mtime *.blk file until the count is within capacity.
+    void evict_if_needed() {
+        for (;;) {
+            std::error_code ec;
+            std::size_t count = 0;
+            std::filesystem::path oldest;
+            std::filesystem::file_time_type oldest_t = std::filesystem::file_time_type::max();
+            for (const auto& entry : std::filesystem::directory_iterator(dir_, ec)) {
+                if (ec) {
+                    return;
+                }
+                if (entry.path().extension() != ".blk") {
+                    continue;
+                }
+                ++count;
+                const auto t = entry.last_write_time(ec);
+                if (ec) {
+                    continue;
+                }
+                if (t < oldest_t) {
+                    oldest_t = t;
+                    oldest = entry.path();
+                }
+            }
+            if (count <= static_cast<std::size_t>(max_blocks_) || oldest.empty()) {
+                return;
+            }
+            std::filesystem::remove(oldest, ec);
+        }
+    }
+
+    std::atomic<bool> enabled_{false};
+    std::mutex mu_;
+    std::string dir_;
+    int max_blocks_ = 0;
+    std::atomic<std::uint64_t> hits_{0};
+    std::atomic<std::uint64_t> misses_{0};
+};
+
+DiskCache g_disk_cache;
+
 // Seekable streambuf over S3 range GETs. Each underflow/refetch pulls one read-ahead window so consecutive
 // slices within a window cost no extra GET (matching the access pattern in nano_lance_external_blob.cpp).
 // The single curl handle is reused across windows so the connection stays keep-alive for the object.
 class S3Streambuf : public std::streambuf {
 public:
-    S3Streambuf(std::shared_ptr<const s3detail::Config> cfg, std::string bucket, std::string key,
-                std::size_t read_ahead)
-        : cfg_(std::move(cfg)), bucket_(std::move(bucket)), key_(std::move(key)), region_(cfg_->region),
-          read_ahead_(read_ahead == 0 ? 1 : read_ahead) {
+    S3Streambuf(std::shared_ptr<const s3detail::Config> cfg, std::string uri, std::string bucket,
+                std::string key, std::size_t read_ahead)
+        : cfg_(std::move(cfg)), uri_(std::move(uri)), bucket_(std::move(bucket)), key_(std::move(key)),
+          region_(cfg_->region), read_ahead_(read_ahead == 0 ? 1 : read_ahead) {
         ensure_curl_global_init();
         curl_ = curl_easy_init();
         const Endpoint e = build_endpoint(*cfg_, bucket_, key_, region_);
@@ -874,20 +1031,22 @@ private:
         return window_start_ + static_cast<std::uint64_t>(gptr() - eback());
     }
 
-    // Position the get area after a successful body fetch. A 206 begins at `start`; a 200 means the server
-    // ignored Range and returned the whole object from offset 0 — place the get pointer at the requested
-    // logical offset within it so reads still land correctly.
-    void install_window(std::uint64_t start, bool partial) {
+    // Position the get area after a successful body (or cache) fetch. `window_origin` is where the fetched
+    // bytes begin in the object: for a 206 (or a cached block) that's the fetch/chunk start; for a 200 the
+    // server ignored Range and returned the whole object from offset 0. `logical_pos` is the offset the
+    // caller seeked to — the get pointer is placed there within the window so reads land correctly even when
+    // the window was fetched aligned to a chunk boundary below `logical_pos`.
+    void install_window(std::uint64_t window_origin, std::uint64_t logical_pos, bool partial) {
         char* base = window_.data();
-        if (partial) {  // 206 Partial Content
-            window_start_ = start;
+        if (partial) {  // 206 Partial Content, or a block served from the disk cache
+            window_start_ = window_origin;
             reached_eof_ = window_.size() < read_ahead_;  // a short window means the object ended here
         } else {  // 200 OK: full object from offset 0
             window_start_ = 0;
             reached_eof_ = true;
         }
         window_len_ = window_.size();
-        std::uint64_t goff = (start >= window_start_) ? (start - window_start_) : 0;
+        std::uint64_t goff = (logical_pos >= window_start_) ? (logical_pos - window_start_) : 0;
         if (goff > window_len_) {
             goff = window_len_;
         }
@@ -901,14 +1060,27 @@ private:
         setg(nullptr, nullptr, nullptr);
     }
 
-    // Fetch [start, start+read_ahead-1] into the window, with retry/backoff and one-shot region redirect.
+    // Make the window hold the bytes covering logical offset `target`, positioning the get pointer there.
+    // Fetches one read-ahead window, with retry/backoff and one-shot region redirect. When the disk cache is
+    // enabled the fetch is aligned to a read-ahead-sized chunk boundary (so any later read within the chunk
+    // is a hit), the block is served from disk on a hit, and a freshly fetched chunk is written back.
     // Returns false only on a real transport/HTTP error (sets the thread error); an empty/short read at
     // end-of-object is a success that flags reached_eof_.
-    bool load_window(std::uint64_t start) {
+    bool load_window(std::uint64_t target) {
         if (curl_ == nullptr) {
             fail("curl init failed");
             return false;
         }
+        // With the cache on, fetch (and key) on the chunk-aligned start; otherwise fetch exactly at target.
+        const bool cache_on = g_disk_cache.enabled();
+        const std::uint64_t start = cache_on ? (target / read_ahead_) * read_ahead_ : target;
+
+        if (cache_on && g_disk_cache.try_load(uri_, start, window_)) {
+            install_window(start, target, /*partial=*/true);
+            g_last_error.clear();
+            return true;
+        }
+
         const Credentials cred = cfg_->creds->get();
         if (!cred.valid()) {
             fail("missing AWS credentials — " + cfg_->creds->diagnostic());
@@ -973,7 +1145,10 @@ private:
             curl_slist_free_all(hdrs);
 
             if (rc == CURLE_OK && (code == 200 || code == 206)) {
-                install_window(start, code == 206);
+                if (cache_on && code == 206) {  // only aligned partial blocks are cacheable
+                    g_disk_cache.store(uri_, start, window_);
+                }
+                install_window(start, target, code == 206);
                 g_last_error.clear();
                 return true;
             }
@@ -1022,6 +1197,7 @@ private:
     }
 
     std::shared_ptr<const s3detail::Config> cfg_;
+    std::string uri_;  // original s3:// URI, used as the disk-cache key
     std::string bucket_;
     std::string key_;
     std::string region_;  // effective region (may change once on a wrong-region redirect)
@@ -1092,12 +1268,20 @@ std::unique_ptr<std::istream> S3MinStreamFactory::open(const std::string& uri, s
         return nullptr;
     }
 
-    auto buf = std::make_unique<S3Streambuf>(config_, bucket, key, read_ahead_bytes);
+    auto buf = std::make_unique<S3Streambuf>(config_, uri, bucket, key, read_ahead_bytes);
     if (!buf->ok()) {
         g_last_error = "failed to initialize libcurl handle";
         return nullptr;
     }
     return std::make_unique<S3IStream>(std::move(buf));
+}
+
+bool configure_disk_cache(const std::string& cache_dir, int max_blocks) {
+    return g_disk_cache.configure(cache_dir, max_blocks);
+}
+
+void disk_cache_stats(std::uint64_t* out_hits, std::uint64_t* out_misses) {
+    g_disk_cache.stats(out_hits, out_misses);
 }
 
 }  // namespace nanos3reader
