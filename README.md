@@ -40,6 +40,7 @@ connection per object, so streaming many small ranges from a few objects is fast
 - **S3-compatible stores**: set `AWS_ENDPOINT_URL` (e.g. `http://localhost:9000`) for path-style MinIO/etc.
 - **Optional disk block cache**: persist fetched blocks to local disk so re-reads skip the network
   entirely (see *Disk block cache* below).
+- **Python bindings**: read/seek API with the same credential chain (see *Python* below).
 
 ## Build & use
 
@@ -81,6 +82,36 @@ target_link_libraries(your_app PRIVATE nanos3reader::nanos3reader)
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Region for virtual-hosted addressing (else the profile's `region`, else `us-east-1`). |
 | `AWS_ENDPOINT_URL` | Custom endpoint (MinIO etc.); switches to path-style addressing. |
 | `AWS_MAX_ATTEMPTS` | Tries per range GET (default 3; full-jitter backoff on transient failures). |
+
+## Python
+
+Python bindings wrap the same read/seek path and credential chain. Build from the repo root:
+
+```bash
+pip install -e ".[test]"
+```
+
+```python
+from nanos3reader import Factory, open
+
+# Simple read
+with open("s3://my-bucket/object") as reader:
+    data = reader.read()
+
+# Factory for multiple opens
+factory = Factory()
+with factory.open("s3://my-bucket/object", read_ahead=4096) as reader:
+    reader.seek(1024)
+    chunk = reader.read(4096)
+```
+
+Example: `examples/s3cat.py` streams a byte range to stdout (the Python equivalent of `examples/s3cat.cpp`).
+CI runs `tests/python/test_minio_integration.py` against MinIO when `NANOS3READER_IT_URI` /
+`NANOS3READER_IT_EXPECT` are set.
+
+| CMake option | Purpose |
+|---|---|
+| `NANOS3READER_BUILD_PYTHON_BINDINGS` | Build the `_nanos3reader` pybind11 module (off by default). |
 
 ## Disk block cache
 

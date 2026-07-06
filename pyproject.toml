@@ -1,0 +1,22 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.13"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "nanos3reader"
+version = "0.3.0"
+description = "Python bindings for nanos3reader — a minimal, read-only S3 range reader"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.scikit-build]
+wheel.packages = ["bindings/nanos3reader"]
+cmake.args = ["-DNANOS3READER_BUILD_PYTHON_BINDINGS=ON", "-DNANOS3READER_BUILD_TESTS=OFF"]
+build-dir = "build-py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
