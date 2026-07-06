@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nanos3reader VERSION 0.2.0 LANGUAGES CXX)
+project(nanos3reader VERSION 0.3.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------------------------------
 # nanos3reader — a minimal, read-only S3 range reader (seekable std::istream over HTTP(S) range GETs +
@@ -30,6 +30,8 @@ option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ${NAN
 # default. When built it still self-skips at run time unless NANOS3READER_IT_URI / _EXPECT are set.
 option(NANOS3READER_BUILD_INTEGRATION_TESTS
     "Build the MinIO integration test (requires a live S3-compatible endpoint at run time)" OFF)
+option(NANOS3READER_BUILD_PYTHON_BINDINGS
+    "Build Python bindings (pybind11 extension module)" OFF)
 set(NANOS3READER_CRYPTO "openssl" CACHE STRING
     "SigV4 SHA-256 backend: openssl (default, links libcrypto) | bundled (in-tree, no crypto link)")
 
@@ -78,6 +80,27 @@ if(NANOS3READER_BUILD_TESTS)
         add_test(NAME minio_integration COMMAND nanos3reader_minio_test)
         set_tests_properties(minio_integration PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+endif()
+
+# --- Python bindings ----------------------------------------------------------------------------
+if(NANOS3READER_BUILD_PYTHON_BINDINGS)
+    # Required when linking the static lib into a shared Python extension module.
+    set_target_properties(nanos3reader PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    include(FetchContent)
+    FetchContent_Declare(
+        pybind11
+        GIT_REPOSITORY https://github.com/pybind/pybind11.git
+        GIT_TAG v2.13.6)
+    FetchContent_MakeAvailable(pybind11)
+
+    pybind11_add_module(_nanos3reader MODULE bindings/src/bindings.cpp)
+    target_link_libraries(_nanos3reader PRIVATE nanos3reader::nanos3reader)
+    target_include_directories(_nanos3reader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+    # Place the extension next to the pure-Python package for local/editable installs.
+    set_target_properties(_nanos3reader PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bindings/nanos3reader)
 endif()
 
 # --- install / find_package(nanos3reader) -------------------------------------------------------

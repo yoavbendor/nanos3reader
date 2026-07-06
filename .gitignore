@@ -1,5 +1,9 @@
 /build/
 /build-*/
+/build-py/
+.venv/
+__pycache__/
+*.pyc
 *.o
 *.a
 *.so

@@ -14,7 +14,7 @@
 // Version, exposed so consumers can feature-gate at compile time (e.g. the disk block cache below was
 // added in 0.2.0). NANOS3READER_VERSION is a single comparable integer: MAJOR*10000 + MINOR*100 + PATCH.
 #define NANOS3READER_VERSION_MAJOR 0
-#define NANOS3READER_VERSION_MINOR 2
+#define NANOS3READER_VERSION_MINOR 3
 #define NANOS3READER_VERSION_PATCH 0
 #define NANOS3READER_VERSION \
     (NANOS3READER_VERSION_MAJOR * 10000 + NANOS3READER_VERSION_MINOR * 100 + NANOS3READER_VERSION_PATCH)
