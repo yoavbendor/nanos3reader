@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "nanos3reader"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python bindings for nanos3reader — a minimal, read-only S3 range reader"
 readme = "README.md"
 license = { text = "Apache-2.0" }

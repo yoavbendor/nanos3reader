@@ -14,7 +14,7 @@
 // Version, exposed so consumers can feature-gate at compile time (e.g. the disk block cache below was
 // added in 0.2.0). NANOS3READER_VERSION is a single comparable integer: MAJOR*10000 + MINOR*100 + PATCH.
 #define NANOS3READER_VERSION_MAJOR 0
-#define NANOS3READER_VERSION_MINOR 3
+#define NANOS3READER_VERSION_MINOR 4
 #define NANOS3READER_VERSION_PATCH 0
 #define NANOS3READER_VERSION \
     (NANOS3READER_VERSION_MAJOR * 10000 + NANOS3READER_VERSION_MINOR * 100 + NANOS3READER_VERSION_PATCH)
@@ -96,6 +96,59 @@ public:
 
 private:
     std::shared_ptr<const s3detail::Config> config_;
+};
+
+// --- Object-store client (HEAD, range GET, ListObjectsV2) -------------------------------------------
+
+// Per-client settings. An empty string falls back to the environment chain used by S3MinStreamFactory
+// (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, shared profile files, ECS, IMDS;
+// AWS_REGION; AWS_ENDPOINT_URL). access_key_id and secret_access_key must be given together.
+struct ClientOptions {
+    std::string access_key_id;
+    std::string secret_access_key;
+    std::string session_token;
+    std::string region;
+    std::string endpoint;        // e.g. "http://127.0.0.1:9000"; non-empty selects path-style addressing
+    bool allow_http = false;     // an http:// endpoint (explicit or from AWS_ENDPOINT_URL) is refused unless set
+};
+
+struct ObjectInfo {
+    std::string key;             // full key inside the bucket (the listed prefix is included)
+    std::uint64_t size = 0;
+};
+
+// Thread-safe client for s3:// objects. One instance may be shared by any number of threads; each thread
+// reuses its own libcurl easy handle, so connections are kept alive across calls. Requests are signed with
+// SigV4. 5xx responses, 429 and 503 SlowDown are retried up to 3 times with jittered backoff, as are transport
+// errors libcurl marks retriable (timeouts, refused or reset connections); 4xx responses are never retried. Every failure is reported in `error` as "s3://bucket/key: ..." with the
+// HTTP status (or the transport error) included.
+class S3Client {
+public:
+    explicit S3Client(ClientOptions options = {});
+    ~S3Client();
+    S3Client(const S3Client&) = delete;
+    S3Client& operator=(const S3Client&) = delete;
+    S3Client(S3Client&&) noexcept;
+    S3Client& operator=(S3Client&&) noexcept;
+
+    // Object size via HEAD. Returns false with `error` set on failure (404 included).
+    bool head(const std::string& uri, std::uint64_t& size, std::string& error);
+
+    // Exactly `n` bytes at `offset` (one range GET). A body shorter than `n` (the object ends first) is an
+    // error. n == 0 succeeds without a request.
+    bool read_range(const std::string& uri, std::uint64_t offset, std::uint64_t n, std::uint8_t* dst,
+                    std::string& error);
+
+    // ListObjectsV2 under prefix_uri ("s3://bucket/prefix/"; an empty prefix lists the whole bucket), following
+    // every continuation page. With a non-empty delimiter (normally "/") only the immediate children are
+    // returned: objects in `objects`, sub-"directories" in `common_prefixes` (full prefixes, e.g. "p/sub/").
+    // Without a delimiter every object under the prefix is returned and `common_prefixes` is left empty.
+    bool list(const std::string& prefix_uri, const std::string& delimiter, std::vector<ObjectInfo>& objects,
+              std::vector<std::string>& common_prefixes, std::string& error);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 // --- Disk-resident LRU block cache -----------------------------------------------------------------

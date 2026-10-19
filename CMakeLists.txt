@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nanos3reader VERSION 0.3.0 LANGUAGES CXX)
+project(nanos3reader VERSION 0.4.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------------------------------
 # nanos3reader — a minimal, read-only S3 range reader (seekable std::istream over HTTP(S) range GETs +
@@ -76,7 +76,8 @@ if(NANOS3READER_BUILD_TESTS)
     # CMake marks it skipped) unless NANOS3READER_IT_URI / NANOS3READER_IT_EXPECT are set in the environment.
     if(NANOS3READER_BUILD_INTEGRATION_TESTS)
         add_executable(nanos3reader_minio_test tests/minio_integration_test.cpp)
-        target_link_libraries(nanos3reader_minio_test PRIVATE nanos3reader::nanos3reader)
+        find_package(Threads REQUIRED)
+        target_link_libraries(nanos3reader_minio_test PRIVATE nanos3reader::nanos3reader Threads::Threads)
         add_test(NAME minio_integration COMMAND nanos3reader_minio_test)
         set_tests_properties(minio_integration PROPERTIES SKIP_RETURN_CODE 77)
     endif()

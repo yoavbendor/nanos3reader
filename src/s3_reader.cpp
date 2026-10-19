@@ -1284,4 +1284,626 @@ void disk_cache_stats(std::uint64_t* out_hits, std::uint64_t* out_misses) {
     g_disk_cache.stats(out_hits, out_misses);
 }
 
+// --- object-store client: HEAD, range GET, ListObjectsV2 -------------------------------------------
+
+namespace {
+
+constexpr int kClientRetries = 3;                   // retries after the first attempt (4 tries in all)
+constexpr std::size_t kClientTextCap = 16u << 20;   // largest list page / error body kept in memory
+
+// One libcurl easy handle per thread, reused for every S3Client on that thread. Each request resets it
+// (which keeps the live connection and DNS/TLS caches) and sets all of its own options.
+struct ThreadCurl {
+    CURL* handle = nullptr;
+    ~ThreadCurl() {
+        if (handle != nullptr) {
+            curl_easy_cleanup(handle);
+        }
+    }
+};
+
+CURL* thread_easy_handle() {
+    thread_local ThreadCurl tc;
+    if (tc.handle == nullptr) {
+        tc.handle = curl_easy_init();
+    }
+    return tc.handle;
+}
+
+// RFC 3986 encoding of one query-string name or value: everything except unreserved bytes, '/' included.
+std::string uri_encode_component(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                                c == '-' || c == '_' || c == '.' || c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back("0123456789ABCDEF"[c >> 4]);
+            out.push_back("0123456789ABCDEF"[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+// "s3://bucket/key" -> bucket and key. Object operations need a non-empty key; listings may have none.
+bool split_s3_uri(const std::string& uri, bool need_key, std::string& bucket, std::string& key,
+                  std::string& error) {
+    if (uri.rfind("s3://", 0) != 0) {
+        error = uri + ": not an s3:// URI";
+        return false;
+    }
+    const std::string rest = uri.substr(5);
+    const auto slash = rest.find('/');
+    bucket = rest.substr(0, slash);
+    key = (slash == std::string::npos) ? std::string() : rest.substr(slash + 1);
+    if (bucket.empty() || (need_key && key.empty())) {
+        error = uri + ": malformed s3:// URI (expected s3://bucket/key)";
+        return false;
+    }
+    return true;
+}
+
+bool parse_u64(const std::string& s, std::uint64_t& out) {
+    if (s.empty()) {
+        return false;
+    }
+    std::uint64_t v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        const auto d = static_cast<std::uint64_t>(c - '0');
+        if (v > (UINT64_MAX - d) / 10) {
+            return false;
+        }
+        v = v * 10 + d;
+    }
+    out = v;
+    return true;
+}
+
+void append_utf8(std::string& out, std::uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+// Decodes the XML entities S3 uses in keys and messages (named, decimal and hex numeric references).
+std::string xml_unescape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '&') {
+            out.push_back(s[i]);
+            continue;
+        }
+        const auto semi = s.find(';', i);
+        if (semi == std::string::npos || semi - i > 12) {
+            out.push_back('&');
+            continue;
+        }
+        const std::string ent = s.substr(i + 1, semi - i - 1);
+        if (ent == "amp") {
+            out.push_back('&');
+        } else if (ent == "lt") {
+            out.push_back('<');
+        } else if (ent == "gt") {
+            out.push_back('>');
+        } else if (ent == "quot") {
+            out.push_back('"');
+        } else if (ent == "apos") {
+            out.push_back('\'');
+        } else if (!ent.empty() && ent[0] == '#') {
+            const bool hex = ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X');
+            const std::size_t first = hex ? 2 : 1;
+            bool ok = ent.size() > first;
+            std::uint32_t cp = 0;
+            for (std::size_t j = first; ok && j < ent.size(); ++j) {
+                const char c = ent[j];
+                std::uint32_t d = 0;
+                if (c >= '0' && c <= '9') {
+                    d = static_cast<std::uint32_t>(c - '0');
+                } else if (hex && c >= 'a' && c <= 'f') {
+                    d = static_cast<std::uint32_t>(c - 'a' + 10);
+                } else if (hex && c >= 'A' && c <= 'F') {
+                    d = static_cast<std::uint32_t>(c - 'A' + 10);
+                } else {
+                    ok = false;
+                    break;
+                }
+                cp = cp * (hex ? 16u : 10u) + d;
+                if (cp > 0x10FFFF) {
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                out.push_back('&');
+                continue;
+            }
+            append_utf8(out, cp);
+        } else {
+            out.push_back('&');
+            continue;
+        }
+        i = semi;
+    }
+    return out;
+}
+
+// Finds the next <tag>...</tag> at or after `pos`. On success `inner` holds the raw text between the tags and
+// `pos` moves past the closing tag. S3 responses carry no attributes on these elements.
+bool next_element(const std::string& xml, std::size_t& pos, const std::string& tag, std::string& inner) {
+    const std::string open = "<" + tag + ">";
+    const std::string close = "</" + tag + ">";
+    const auto b = xml.find(open, pos);
+    if (b == std::string::npos) {
+        return false;
+    }
+    const std::size_t start = b + open.size();
+    const auto e = xml.find(close, start);
+    if (e == std::string::npos) {
+        return false;
+    }
+    inner = xml.substr(start, e - start);
+    pos = e + close.size();
+    return true;
+}
+
+// The <Code> of an S3 XML error body, or "" when there is none.
+std::string xml_error_code(const std::string& body) {
+    std::size_t pos = 0;
+    std::string code;
+    if (next_element(body, pos, "Code", code)) {
+        return xml_unescape(code);
+    }
+    return "";
+}
+
+// Canonical query string for ListObjectsV2: parameter names in byte order, values encoded.
+std::string list_query(const std::string& prefix, const std::string& delimiter, const std::string& token) {
+    std::string q;
+    if (!token.empty()) {
+        q += "continuation-token=" + uri_encode_component(token) + "&";
+    }
+    if (!delimiter.empty()) {
+        q += "delimiter=" + uri_encode_component(delimiter) + "&";
+    }
+    q += "list-type=2&prefix=" + uri_encode_component(prefix);
+    return q;
+}
+
+// Parses one ListObjectsV2 page: appends its objects and common prefixes and reports the continuation.
+bool parse_list_page(const std::string& xml, std::vector<ObjectInfo>& objects, std::vector<std::string>& prefixes,
+                     bool& truncated, std::string& next_token, std::string& error) {
+    std::size_t pos = 0;
+    std::string body;
+    while (next_element(xml, pos, "Contents", body)) {
+        std::size_t key_pos = 0;
+        std::size_t size_pos = 0;
+        std::string key;
+        std::string size_text;
+        std::uint64_t size = 0;
+        if (!next_element(body, key_pos, "Key", key) || !next_element(body, size_pos, "Size", size_text) ||
+            !parse_u64(size_text, size)) {
+            error = "malformed ListObjectsV2 response (Contents)";
+            return false;
+        }
+        objects.push_back(ObjectInfo{xml_unescape(key), size});
+    }
+    pos = 0;
+    while (next_element(xml, pos, "CommonPrefixes", body)) {
+        std::size_t p = 0;
+        std::string prefix;
+        if (!next_element(body, p, "Prefix", prefix)) {
+            error = "malformed ListObjectsV2 response (CommonPrefixes)";
+            return false;
+        }
+        prefixes.push_back(xml_unescape(prefix));
+    }
+    std::string flag;
+    pos = 0;
+    truncated = next_element(xml, pos, "IsTruncated", flag) && flag == "true";
+    std::string tok;
+    pos = 0;
+    next_token.clear();
+    if (next_element(xml, pos, "NextContinuationToken", tok)) {
+        next_token = xml_unescape(tok);
+    }
+    if (truncated && next_token.empty()) {
+        error = "truncated ListObjectsV2 response without NextContinuationToken";
+        return false;
+    }
+    return true;
+}
+
+// One signed request. `dst` receives the body of a 206 for a range read (exactly `dst_cap` bytes at most);
+// every other body is collected into the reply's text.
+struct Call {
+    std::string method;  // "GET" or "HEAD"
+    std::string bucket;
+    std::string key;     // "" for a listing (bucket root)
+    std::string query;   // canonical, already encoded; "" when none
+    std::string range;   // "bytes=a-b" or ""
+    std::uint8_t* dst = nullptr;
+    std::size_t dst_cap = 0;
+};
+
+struct Reply {
+    long code = 0;
+    CURLcode rc = CURLE_OK;
+    bool overflow = false;  // the body was larger than dst_cap / the text cap, and the transfer was aborted
+    std::size_t dst_len = 0;
+    std::int64_t content_length = -1;  // HEAD only
+    std::string text;
+};
+
+// Write-callback state, one per attempt.
+struct Sink {
+    CURL* handle = nullptr;
+    std::uint8_t* dst = nullptr;
+    std::size_t dst_cap = 0;
+    std::size_t dst_len = 0;
+    std::string text;
+    bool overflow = false;
+};
+
+std::size_t sink_write(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
+    const std::size_t n = size * nmemb;
+    auto* s = static_cast<Sink*>(userdata);
+    long code = 0;
+    curl_easy_getinfo(s->handle, CURLINFO_RESPONSE_CODE, &code);
+    if (s->dst != nullptr && code == 206) {
+        if (n > s->dst_cap - s->dst_len) {
+            s->overflow = true;
+            return 0;  // abort: more bytes than the caller asked for
+        }
+        std::memcpy(s->dst + s->dst_len, ptr, n);
+        s->dst_len += n;
+        return n;
+    }
+    if (s->text.size() + n > kClientTextCap) {
+        s->overflow = true;
+        return 0;
+    }
+    s->text.append(ptr, n);
+    return n;
+}
+
+// Sends `call` with SigV4 signing, retrying 5xx, 429 and transport errors that libcurl marks retriable.
+// Returns false only when no request could be made (no credentials, no handle); otherwise `reply` holds the
+// last attempt's outcome, and the caller interprets it.
+bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, const Call& call, Reply& reply,
+                 std::string& error) {
+    ensure_curl_global_init();
+    const std::string shown = "s3://" + call.bucket + (call.key.empty() ? "" : "/" + call.key);
+    Credentials cred;
+    if (fixed_creds != nullptr) {
+        cred = *fixed_creds;
+    } else {
+        cred = cfg.creds->get();
+        if (!cred.valid()) {
+            error = shown + ": missing AWS credentials — " + cfg.creds->diagnostic();
+            return false;
+        }
+    }
+    const Endpoint ep = build_endpoint(cfg, call.bucket, call.key, cfg.region);
+    std::string url = ep.url;
+    if (!call.query.empty()) {
+        url += "?" + call.query;
+    }
+    CURL* h = thread_easy_handle();
+    if (h == nullptr) {
+        error = shown + ": failed to initialize libcurl handle";
+        return false;
+    }
+
+    for (int attempt = 0;; ++attempt) {
+        const std::string amz_date = amz_now();  // fresh per attempt so a backoff never skews the signature
+        std::vector<s3v4::Header> sign_headers = {
+            {"host", ep.host},
+            {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"},
+            {"x-amz-date", amz_date},
+        };
+        if (!call.range.empty()) {
+            sign_headers.push_back({"range", call.range});
+        }
+        if (!cred.session_token.empty()) {
+            sign_headers.push_back({"x-amz-security-token", cred.session_token});
+        }
+        s3v4::CanonicalRequest req;
+        req.method = call.method;
+        req.uri = ep.path;
+        req.query = call.query;
+        req.headers = sign_headers;
+        req.payload_hash = "UNSIGNED-PAYLOAD";
+        const std::string authz =
+            s3v4::build_authorization(req, cred.access_key, cred.secret_key, cfg.region, "s3", amz_date);
+
+        curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, ("x-amz-date: " + amz_date).c_str());
+        hdrs = curl_slist_append(hdrs, "x-amz-content-sha256: UNSIGNED-PAYLOAD");
+        if (!call.range.empty()) {
+            hdrs = curl_slist_append(hdrs, ("Range: " + call.range).c_str());
+        }
+        if (!cred.session_token.empty()) {
+            hdrs = curl_slist_append(hdrs, ("x-amz-security-token: " + cred.session_token).c_str());
+        }
+        hdrs = curl_slist_append(hdrs, ("Authorization: " + authz).c_str());
+
+        Sink sink;
+        sink.handle = h;
+        sink.dst = call.dst;
+        sink.dst_cap = call.dst_cap;
+        curl_easy_reset(h);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        if (call.method == "HEAD") {
+            curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+        } else {
+            curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+        }
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &sink_write);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &sink);
+        curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, kConnectTimeoutSec);
+        curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, kLowSpeedBytes);
+        curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, kLowSpeedTimeSec);
+
+        const CURLcode rc = curl_easy_perform(h);
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        curl_off_t clen = -1;
+        if (call.method == "HEAD") {
+            curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &clen);
+        }
+        curl_slist_free_all(hdrs);
+
+        reply.code = code;
+        reply.rc = rc;
+        reply.overflow = sink.overflow;
+        reply.dst_len = sink.dst_len;
+        reply.content_length = static_cast<std::int64_t>(clen);
+        reply.text = std::move(sink.text);
+
+        const bool http_retriable = rc == CURLE_OK && (code == 429 || code == 500 || code == 502 ||
+                                                       code == 503 || code == 504);  // 503 SlowDown included
+        const bool transport_retriable = rc != CURLE_OK && !sink.overflow && is_retriable_curl(rc);
+        if ((http_retriable || transport_retriable) && attempt < kClientRetries) {
+            sleep_backoff(attempt + 1);
+            continue;
+        }
+        return true;
+    }
+}
+
+// Message for an HTTP status that is not the expected success.
+std::string http_failure(const std::string& shown, const Reply& r) {
+    std::string msg = shown + ": HTTP " + std::to_string(r.code);
+    const std::string xc = xml_error_code(r.text);
+    if (!xc.empty()) {
+        msg += " " + xc;
+    }
+    return msg;
+}
+
+// Message for a request that got no usable HTTP response (transfer failed or was aborted).
+std::string transfer_failure(const std::string& shown, const Reply& r) {
+    if (r.overflow) {
+        return shown + ": response body is larger than the request asked for";
+    }
+    return shown + ": " + curl_easy_strerror(r.rc);
+}
+
+}  // namespace
+
+struct S3Client::Impl {
+    s3detail::Config cfg;          // region, endpoint, path_style; creds is the env chain (null when static)
+    bool has_fixed_creds = false;  // explicit ClientOptions keys
+    Credentials fixed_creds;
+    std::string refusal;           // non-empty: every call fails with this message (bad options, plain HTTP)
+};
+
+S3Client::S3Client(ClientOptions options) : impl_(std::make_unique<Impl>()) {
+    Impl& im = *impl_;
+    const bool have_ak = !options.access_key_id.empty();
+    const bool have_sk = !options.secret_access_key.empty();
+    const std::string profile = aws_profile();
+    if (have_ak != have_sk) {
+        im.refusal = "ClientOptions: access_key_id and secret_access_key must be given together";
+    } else if (have_ak) {
+        im.has_fixed_creds = true;
+        im.fixed_creds = Credentials{options.access_key_id, options.secret_access_key, options.session_token,
+                                     std::nullopt};
+    } else {
+        im.cfg.creds = std::make_shared<CredentialProvider>(profile);
+    }
+
+    std::string region = options.region;
+    if (region.empty()) {
+        region = env_or("AWS_REGION", env_or("AWS_DEFAULT_REGION", ""));
+    }
+    if (region.empty()) {
+        Credentials ignore;
+        load_profile(profile, ignore, region);
+    }
+    im.cfg.region = region.empty() ? "us-east-1" : region;
+
+    im.cfg.endpoint = options.endpoint.empty() ? env_or("AWS_ENDPOINT_URL", "") : options.endpoint;
+    im.cfg.path_style = !im.cfg.endpoint.empty();
+    im.cfg.max_attempts = kClientRetries + 1;
+    // As Lance's object store: allow_http from the options, else AWS_ALLOW_HTTP=true in the environment.
+    std::string allow_env = env_or("AWS_ALLOW_HTTP", "");
+    for (auto& ch : allow_env) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    const bool allow_http = options.allow_http || allow_env == "true";
+    if (im.refusal.empty() && im.cfg.endpoint.rfind("http://", 0) == 0 && !allow_http) {
+        im.refusal = "endpoint " + im.cfg.endpoint +
+                     " is plain HTTP; set ClientOptions::allow_http (or AWS_ALLOW_HTTP=true) to allow it";
+    }
+}
+
+S3Client::~S3Client() = default;
+S3Client::S3Client(S3Client&&) noexcept = default;
+S3Client& S3Client::operator=(S3Client&&) noexcept = default;
+
+bool S3Client::head(const std::string& uri, std::uint64_t& size, std::string& error) {
+    error.clear();
+    std::string bucket;
+    std::string key;
+    if (!split_s3_uri(uri, true, bucket, key, error)) {
+        return false;
+    }
+    if (!impl_->refusal.empty()) {
+        error = uri + ": " + impl_->refusal;
+        return false;
+    }
+    Call call;
+    call.method = "HEAD";
+    call.bucket = bucket;
+    call.key = key;
+    Reply r;
+    if (!run_request(impl_->cfg, impl_->has_fixed_creds ? &impl_->fixed_creds : nullptr, call, r, error)) {
+        return false;
+    }
+    if (r.overflow || r.rc != CURLE_OK) {
+        error = transfer_failure(uri, r);
+        return false;
+    }
+    if (r.code != 200) {
+        error = http_failure(uri, r);
+        return false;
+    }
+    if (r.content_length < 0) {
+        error = uri + ": HEAD response has no Content-Length";
+        return false;
+    }
+    size = static_cast<std::uint64_t>(r.content_length);
+    return true;
+}
+
+bool S3Client::read_range(const std::string& uri, std::uint64_t offset, std::uint64_t n, std::uint8_t* dst,
+                          std::string& error) {
+    error.clear();
+    std::string bucket;
+    std::string key;
+    if (!split_s3_uri(uri, true, bucket, key, error)) {
+        return false;
+    }
+    if (!impl_->refusal.empty()) {
+        error = uri + ": " + impl_->refusal;
+        return false;
+    }
+    if (n == 0) {
+        return true;
+    }
+    if (dst == nullptr) {
+        error = uri + ": read_range called with a null destination";
+        return false;
+    }
+    if (offset > UINT64_MAX - (n - 1)) {
+        error = uri + ": byte range overflows 64 bits";
+        return false;
+    }
+    const std::uint64_t last = offset + n - 1;
+    Call call;
+    call.method = "GET";
+    call.bucket = bucket;
+    call.key = key;
+    call.range = "bytes=" + std::to_string(offset) + "-" + std::to_string(last);
+    call.dst = dst;
+    call.dst_cap = static_cast<std::size_t>(n);
+    Reply r;
+    if (!run_request(impl_->cfg, impl_->has_fixed_creds ? &impl_->fixed_creds : nullptr, call, r, error)) {
+        return false;
+    }
+    if (r.overflow || r.rc != CURLE_OK) {
+        error = transfer_failure(uri, r);
+        return false;
+    }
+    if (r.code == 200) {
+        error = uri + ": server ignored the Range header (HTTP 200)";
+        return false;
+    }
+    if (r.code != 206) {
+        error = http_failure(uri, r);
+        return false;
+    }
+    if (static_cast<std::uint64_t>(r.dst_len) != n) {
+        error = uri + ": short read at offset " + std::to_string(offset) + ": got " +
+                std::to_string(r.dst_len) + " of " + std::to_string(n) + " bytes (object ends first)";
+        return false;
+    }
+    return true;
+}
+
+bool S3Client::list(const std::string& prefix_uri, const std::string& delimiter, std::vector<ObjectInfo>& objects,
+                    std::vector<std::string>& common_prefixes, std::string& error) {
+    error.clear();
+    std::vector<ObjectInfo> found;
+    std::vector<std::string> prefixes;
+    std::string bucket;
+    std::string prefix;
+    if (!split_s3_uri(prefix_uri, false, bucket, prefix, error)) {
+        return false;
+    }
+    if (!impl_->refusal.empty()) {
+        error = prefix_uri + ": " + impl_->refusal;
+        return false;
+    }
+    std::string token;
+    for (;;) {
+        Call call;
+        call.method = "GET";
+        call.bucket = bucket;
+        call.query = list_query(prefix, delimiter, token);
+        Reply r;
+        if (!run_request(impl_->cfg, impl_->has_fixed_creds ? &impl_->fixed_creds : nullptr, call, r, error)) {
+            return false;
+        }
+        if (r.overflow || r.rc != CURLE_OK) {
+            error = transfer_failure(prefix_uri, r);
+            return false;
+        }
+        if (r.code != 200) {
+            error = http_failure(prefix_uri, r);
+            return false;
+        }
+        bool truncated = false;
+        std::string next;
+        if (!parse_list_page(r.text, found, prefixes, truncated, next, error)) {
+            error = prefix_uri + ": " + error;
+            return false;
+        }
+        if (!truncated) {
+            break;
+        }
+        if (next == token) {
+            error = prefix_uri + ": listing did not advance (repeated continuation token)";
+            return false;
+        }
+        token = next;
+    }
+    objects = std::move(found);
+    common_prefixes = std::move(prefixes);
+    return true;
+}
+
 }  // namespace nanos3reader
