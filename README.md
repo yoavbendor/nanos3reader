@@ -270,6 +270,21 @@ explicitly, first match wins:
 names the source and how to override it. Linking the library into another static binary:
 `libnanos3reader.a libcurl.a libssl.a libcrypto.a libz.a -lpthread -ldl`.
 
+## Fault injection (tests only)
+
+`NANOS3READER_FAULTS` makes chosen requests fail, for testing commit protocols built on the client
+(never set it in production). Rules are `<action>:<METHOD>:<key substring>:<n>`, comma-separated; `<n>` is
+the 1-based count of matching attempts the rule hits, or `*` for every one (retries are attempts too):
+
+| action | effect |
+|---|---|
+| `fail` | the request is not sent; the attempt fails as an unreachable host (retried) |
+| `http500` | the request is not sent; the attempt answers HTTP 500 (retried) |
+| `lost` | the request is sent and applied, then its reply is dropped (a timeout): a retried conditional PUT sees its own write as a 412 |
+| `nocond` | `If-None-Match` / `If-Match` are not sent: a store that ignores conditional writes |
+
+Example: `NANOS3READER_FAULTS="lost:PUT:_versions/:1"` loses the reply of the first manifest PUT.
+
 ## Scope & non-goals
 
 Reads, listing, `PUT` and multipart uploads of files and directories. No `DELETE` (other than aborting a

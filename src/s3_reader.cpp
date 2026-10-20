@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -1836,6 +1837,90 @@ std::size_t capture_etag(char* buffer, std::size_t size, std::size_t nitems, voi
 // Sends `call` with SigV4 signing, retrying 5xx, 429 and transport errors that libcurl marks retriable.
 // Returns false only when no request could be made (no credentials, no handle); otherwise `reply` holds the
 // last attempt's outcome, and the caller interprets it.
+// Test-only fault injection, for the commit protocols built on this client (never set in production):
+//   NANOS3READER_FAULTS="<action>:<METHOD>:<key substring>:<n>[,...]"
+// matches requests by method and a substring of the key; <n> is the 1-based count of matching
+// attempts the rule hits ("*": every one). Actions:
+//   fail       no request is sent; the attempt fails as an unreachable host (retried as such)
+//   http500    no request is sent; the attempt answers HTTP 500 (retried as such)
+//   lost       the request is sent and the server acts on it, then the reply is dropped: the attempt
+//              fails as a timeout, so a retry sees the effect of the first one (a PUT's 412)
+//   nocond     If-None-Match / If-Match are not sent (a store that ignores conditional writes)
+// Retries are attempts too: "fail:PUT:data/:*" fails a PUT under data/ however often it is retried.
+enum class FaultAction { None, Fail, Http500, Lost, NoCond };
+
+struct FaultRule {
+    FaultAction action = FaultAction::None;
+    std::string method;
+    std::string key_part;
+    std::uint64_t nth = 0;  // 0: every matching attempt
+    std::atomic<std::uint64_t> seen{0};
+};
+
+std::vector<std::unique_ptr<FaultRule>>& fault_rules() {
+    static std::vector<std::unique_ptr<FaultRule>> rules = [] {
+        std::vector<std::unique_ptr<FaultRule>> out;
+        const char* env = std::getenv("NANOS3READER_FAULTS");
+        std::string spec = env != nullptr ? env : "";
+        std::size_t at = 0;
+        while (at < spec.size()) {
+            std::size_t end = spec.find(',', at);
+            if (end == std::string::npos) {
+                end = spec.size();
+            }
+            const std::string item = spec.substr(at, end - at);
+            at = end + 1;
+            std::vector<std::string> parts;
+            std::size_t p = 0;
+            for (int i = 0; i < 3; ++i) {
+                const std::size_t colon = item.find(':', p);
+                if (colon == std::string::npos) {
+                    break;
+                }
+                parts.push_back(item.substr(p, colon - p));
+                p = colon + 1;
+            }
+            if (parts.size() != 3) {
+                continue;
+            }
+            auto rule = std::make_unique<FaultRule>();
+            const std::string& action = parts[0];
+            rule->action = action == "fail"      ? FaultAction::Fail
+                           : action == "http500" ? FaultAction::Http500
+                           : action == "lost"    ? FaultAction::Lost
+                           : action == "nocond"  ? FaultAction::NoCond
+                                                 : FaultAction::None;
+            rule->method = parts[1];
+            rule->key_part = parts[2];
+            const std::string nth = item.substr(p);
+            rule->nth = nth == "*" ? 0U : std::strtoull(nth.c_str(), nullptr, 10);
+            if (rule->action != FaultAction::None && (nth == "*" || rule->nth > 0U)) {
+                out.push_back(std::move(rule));
+            }
+        }
+        return out;
+    }();
+    return rules;
+}
+
+/// The fault this attempt of `call` is to suffer (None when no rule matches, the usual case).
+FaultAction fault_for(const Call& call) {
+    auto& rules = fault_rules();
+    if (rules.empty()) {
+        return FaultAction::None;
+    }
+    for (auto& rule : rules) {
+        if (rule->method != call.method || call.key.find(rule->key_part) == std::string::npos) {
+            continue;
+        }
+        const std::uint64_t n = rule->seen.fetch_add(1U) + 1U;
+        if (rule->nth == 0U || n == rule->nth) {
+            return rule->action;
+        }
+    }
+    return FaultAction::None;
+}
+
 bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, const Call& call, Reply& reply,
                  std::string& error) {
     ensure_curl_global_init();
@@ -1874,6 +1959,17 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
     }
 
     for (int attempt = 0;; ++attempt) {
+        const FaultAction fault = fault_for(call);
+        if (fault == FaultAction::Fail || fault == FaultAction::Http500) {
+            reply = Reply{};
+            reply.rc = fault == FaultAction::Fail ? CURLE_COULDNT_CONNECT : CURLE_OK;
+            reply.code = fault == FaultAction::Fail ? 0 : 500;
+            if (attempt < kClientRetries) {
+                sleep_backoff(attempt + 1);
+                continue;
+            }
+            return true;
+        }
         const std::string amz_date = amz_now();  // fresh per attempt so a backoff never skews the signature
         std::vector<s3v4::Header> sign_headers = {
             {"host", ep.host},
@@ -1899,6 +1995,9 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         hdrs = curl_slist_append(hdrs, ("x-amz-date: " + amz_date).c_str());
         hdrs = curl_slist_append(hdrs, ("x-amz-content-sha256: " + payload_hash).c_str());
         for (const auto& extra : call.extra_headers) {
+            if (fault == FaultAction::NoCond && (extra.rfind("If-None-Match:", 0) == 0 || extra.rfind("If-Match:", 0) == 0)) {
+                continue;
+            }
             hdrs = curl_slist_append(hdrs, extra.c_str());
         }
         if (put || post) {
@@ -1963,21 +2062,21 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         }
         curl_slist_free_all(hdrs);
 
-        reply.code = code;
-        reply.rc = rc;
+        reply.code = fault == FaultAction::Lost ? 0 : code;
+        reply.rc = fault == FaultAction::Lost ? CURLE_OPERATION_TIMEDOUT : rc;
         reply.overflow = sink.overflow;
         reply.dst_len = sink.dst_len;
         reply.content_length = static_cast<std::int64_t>(clen);
         reply.text = std::move(sink.text);
         reply.etag = std::move(etag);
 
-        const bool http_retriable = rc == CURLE_OK && (code == 429 || code == 500 || code == 502 ||
+        const bool http_retriable = reply.rc == CURLE_OK && (code == 429 || code == 500 || code == 502 ||
                                                        code == 503 || code == 504);  // 503 SlowDown included
         if (upload.failed) {
             reply.rc = CURLE_READ_ERROR;  // the local file, not the network: no retry would help
             return true;
         }
-        const bool transport_retriable = rc != CURLE_OK && !sink.overflow && is_retriable_curl(rc);
+        const bool transport_retriable = reply.rc != CURLE_OK && !sink.overflow && is_retriable_curl(reply.rc);
         if ((http_retriable || transport_retriable) && attempt < kClientRetries) {
             sleep_backoff(attempt + 1);
             continue;
