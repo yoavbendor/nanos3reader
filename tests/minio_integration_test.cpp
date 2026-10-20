@@ -376,6 +376,110 @@ void put_checks(const std::string& prefix) {
     if (client.put("not-a-uri", body2.data(), body2.size(), PutOptions{}, nullptr, err)) fail("put of a bad URI");
 }
 
+// S3Client::put_file / put_directory: a small file (one PUT), a multipart file (three parts, the last short),
+// signed and unsigned payloads, and a directory tree mapped to <prefix>/<relative path> -- every key and
+// byte checked by reading it back -- plus the errors for a missing file and a missing directory.
+void file_upload_checks(const std::string& prefix) {
+    using nanos3reader::ClientOptions;
+    using nanos3reader::DirectoryUploadOptions;
+    using nanos3reader::DirectoryUploadStats;
+    using nanos3reader::FileUploadOptions;
+    using nanos3reader::FileUploadResult;
+    using nanos3reader::S3Client;
+    namespace fs = std::filesystem;
+
+    ClientOptions http_ok;
+    http_ok.allow_http = true;
+    S3Client client(http_ok);
+    std::string err;
+    const std::string run = std::to_string(static_cast<unsigned long long>(::getpid())) + "-" +
+                            std::to_string(static_cast<unsigned long long>(std::time(nullptr)));
+    const fs::path root = fs::temp_directory_path() / ("nanos3reader-upload-" + run);
+    std::error_code ec;
+    fs::create_directories(root / "tree" / "sub dir" / "deeper", ec);
+    const auto write = [](const fs::path& p, std::size_t n, unsigned seed) {
+        std::string data(n, '\0');
+        for (std::size_t i = 0; i < n; ++i) data[i] = static_cast<char>((i * 2654435761U + seed) >> 7U);
+        std::ofstream(p, std::ios::binary) << data;
+        return data;
+    };
+    const auto read_back = [&](const std::string& uri, std::string& out) {
+        std::uint64_t size = 0;
+        if (!client.head(uri, size, err)) return false;
+        out.assign(static_cast<std::size_t>(size), '\0');
+        return size == 0 || client.read_range(uri, 0, size, reinterpret_cast<std::uint8_t*>(out.data()), err);
+    };
+
+    // One file, one PUT and as a multipart upload (5 MiB parts, 13 MiB file: parts of 5, 5 and 3 MiB).
+    const std::string big = write(root / "big.bin", 13U << 20U, 3);
+    for (const bool sign : {false, true}) {
+        FileUploadOptions single;
+        single.sign_payload = sign;
+        FileUploadOptions multi = single;
+        multi.multipart_threshold = 5U << 20U;
+        multi.part_size = 5U << 20U;
+        multi.part_concurrency = 2;
+        for (const auto* o : {&single, &multi}) {
+            const std::string uri = prefix + "files-" + run + "/" + (o == &single ? "one" : "multi") +
+                                    (sign ? "-signed" : "") + ".bin";
+            std::string etag;
+            std::string got;
+            if (!client.put_file(uri, (root / "big.bin").string(), *o, &etag, err)) {
+                fail("put_file " + uri + ": " + err);
+            } else if (!read_back(uri, got) || got != big) {
+                fail("put_file " + uri + " reads back different bytes: " + err);
+            } else if (o == &multi && etag.find("-3") == std::string::npos) {
+                fail("multipart put_file did not go up in 3 parts (ETag " + etag + ")");
+            }
+        }
+    }
+
+    // A tree: nested directories, names that need escaping, an empty file.
+    std::map<std::string, std::string> files;
+    files["top.txt"] = write(root / "tree" / "top.txt", 1000, 1);
+    files["empty.bin"] = write(root / "tree" / "empty.bin", 0, 2);
+    files["sub dir/a+b=c.bin"] = write(root / "tree" / "sub dir" / "a+b=c.bin", 70000, 4);
+    files["sub dir/deeper/x%20y #1.dat"] = write(root / "tree" / "sub dir" / "deeper" / "x%20y #1.dat", 12345, 5);
+    files["sub dir/deeper/large.bin"] = write(root / "tree" / "sub dir" / "deeper" / "large.bin", 11U << 20U, 6);
+    DirectoryUploadOptions dopts;
+    dopts.concurrency = 3;
+    dopts.file.multipart_threshold = 5U << 20U;
+    dopts.file.part_size = 5U << 20U;
+    DirectoryUploadStats stats;
+    std::size_t reported = 0;
+    const std::string tree = prefix + "tree-" + run;  // no trailing '/': put_directory adds one
+    if (!client.put_directory((root / "tree").string(), tree, dopts,
+                              [&](const FileUploadResult& r) {
+                                  ++reported;
+                                  if (!r.ok) fail("put_directory: " + r.path + ": " + r.error);
+                              },
+                              stats, err)) {
+        fail("put_directory: " + err);
+    }
+    if (reported != files.size() || stats.files != files.size() || stats.failed != 0) {
+        fail("put_directory reported " + std::to_string(reported) + " files, uploaded " +
+             std::to_string(stats.files) + ", want " + std::to_string(files.size()));
+    }
+    std::vector<nanos3reader::ObjectInfo> listed;
+    std::vector<std::string> common;
+    if (!client.list(tree + "/", "", listed, common, err) || listed.size() != files.size()) {
+        fail("put_directory: listing has " + std::to_string(listed.size()) + " objects: " + err);
+    }
+    for (const auto& [rel, data] : files) {
+        std::string got;
+        if (!read_back(tree + "/" + rel, got) || got != data) fail("put_directory: " + rel + " differs: " + err);
+    }
+
+    // Errors.
+    if (client.put_file(prefix + "x", (root / "missing.bin").string(), FileUploadOptions{}, nullptr, err)) {
+        fail("put_file of a missing file succeeded");
+    }
+    if (client.put_directory((root / "missing").string(), tree, dopts, nullptr, stats, err)) {
+        fail("put_directory of a missing directory succeeded");
+    }
+    fs::remove_all(root, ec);
+}
+
 int main() {
     const char* uri_c = env("NANOS3READER_IT_URI");
     const char* expect_c = env("NANOS3READER_IT_EXPECT");
@@ -530,9 +634,10 @@ int main() {
         fail("NANOS3READER_IT_LISTING must name the seeded listing prefix (s3://bucket/listing/)");
     }
 
-    // 8. S3Client::put under a writable prefix.
+    // 8. S3Client::put, put_file and put_directory under a writable prefix.
     if (const char* put_prefix = env("NANOS3READER_IT_PUT_PREFIX")) {
         put_checks(put_prefix);
+        file_upload_checks(put_prefix);
     } else {
         fail("NANOS3READER_IT_PUT_PREFIX must name a prefix the test may write under (s3://bucket/put/)");
     }

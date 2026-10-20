@@ -26,6 +26,7 @@ endif()
 
 option(NANOS3READER_BUILD_TESTS    "Build tests (SigV4 known-answer test)" ${NANOS3READER_TOP_LEVEL})
 option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ${NANOS3READER_TOP_LEVEL})
+option(NANOS3READER_BUILD_TOOLS    "Build the s3put upload tool"           ${NANOS3READER_TOP_LEVEL})
 # The MinIO integration test needs a live S3-compatible endpoint (CI spins one up), so it is off by
 # default. When built it still self-skips at run time unless NANOS3READER_IT_URI / _EXPECT are set.
 option(NANOS3READER_BUILD_INTEGRATION_TESTS
@@ -63,6 +64,13 @@ endif()
 if(NANOS3READER_BUILD_EXAMPLES)
     add_executable(s3cat examples/s3cat.cpp)
     target_link_libraries(s3cat PRIVATE nanos3reader::nanos3reader)
+endif()
+
+# --- tools --------------------------------------------------------------------------------------
+if(NANOS3READER_BUILD_TOOLS)
+    add_executable(s3put tools/s3put.cpp)
+    target_link_libraries(s3put PRIVATE nanos3reader::nanos3reader)
+    target_compile_features(s3put PRIVATE cxx_std_17)
 endif()
 
 # --- tests --------------------------------------------------------------------------------------
@@ -117,6 +125,9 @@ if(NANOS3READER_TOP_LEVEL)
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    if(NANOS3READER_BUILD_TOOLS)
+        install(TARGETS s3put RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
     install(EXPORT nanos3readerTargets
             FILE nanos3readerTargets.cmake
             NAMESPACE nanos3reader::

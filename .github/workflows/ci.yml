@@ -89,6 +89,22 @@ jobs:
           NANOS3READER_IT_PUT_PREFIX: s3://nanos3reader-it/put/
         run: ctest --test-dir build --output-on-failure -R minio_integration
 
+      - name: s3put (directory upload, same layout as Path.rglob)
+        run: |
+          mkdir -p tree/"sub dir"/deeper
+          head -c 12000000 /dev/urandom > tree/big.bin            # multipart with --multipart-threshold 8
+          echo one > tree/a.txt
+          echo two > "tree/sub dir/b c.txt"
+          : > tree/sub\ dir/deeper/empty.bin
+          ./build/s3put --multipart-threshold 8 --part-size 5 tree "s3://${BUCKET}/s3put/run1/"
+          ./build/s3put tree/a.txt "s3://${BUCKET}/s3put/single/"
+          aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp --recursive "s3://${BUCKET}/s3put/run1/" back
+          diff -r tree back
+          test "$(aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 ls --recursive "s3://${BUCKET}/s3put/run1/" | wc -l)" -eq 4
+          aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp "s3://${BUCKET}/s3put/single/a.txt" - | grep -qx one
+          if ./build/s3put tree "s3://${BUCKET}-missing/x/"; then echo "expected a failure"; exit 1; fi
+          if ./build/s3put does-not-exist "s3://${BUCKET}/x/"; then echo "expected a failure"; exit 1; fi
+
       - name: S3 server log (on failure)
         if: failure()
         run: cat moto.log || true

@@ -6,8 +6,9 @@ store — MinIO, R2, …) as a **seekable, read-ahead-buffered `std::istream`** 
 
 It does one thing well: fetch byte ranges out of S3 objects, with the full AWS credential chain. Beside the
 stream, `S3Client` does `HEAD`, exact range reads, `ListObjectsV2` and a **single-request `PUT`** of a whole
-object (up to 5 GiB, optionally conditional: create-only or compare-and-swap on the ETag). There is no
-multipart upload.
+object (up to 5 GiB, optionally conditional: create-only or compare-and-swap on the ETag), and streams files
+and whole directory trees up with multipart uploads and parallel transfers (`put_file`, `put_directory`, and
+the `s3put` command).
 
 ```cpp
 #include "nanos3reader/s3_reader.h"
@@ -113,6 +114,40 @@ nanos3reader::PutOptions swap;
 swap.if_match = etag;
 ```
 
+Files and directories are streamed from disk, never read whole:
+
+```cpp
+nanos3reader::FileUploadOptions file;            // multipart from 64 MiB, 16 MiB parts, 4 parts at once
+client.put_file("s3://my-bucket/run/out.bin", "/data/out.bin", file, &etag, err);
+
+nanos3reader::DirectoryUploadOptions dir;        // 8 files at once, largest first
+nanos3reader::DirectoryUploadStats stats;
+client.put_directory("/data/results", "s3://my-bucket/run/stream/", dir,
+                     [](const nanos3reader::FileUploadResult& r) { /* one call per file, serialized */ },
+                     stats, err);                // false if any file failed; every file is attempted
+```
+
+`put_directory` maps each regular file to `<prefix>/<path relative to the directory>` ('/' separators),
+following symlinks to files and not symlinked directories (as Python's `Path.rglob` walks). Bodies go as
+`UNSIGNED-PAYLOAD` by default (no second read of each file; TLS protects the transfer); set
+`sign_payload` to sign each file's SHA-256 instead. A failed multipart upload is aborted, so no parts are
+left behind, and a file that changes size while it is sent fails rather than leaving a short object.
+
+### `s3put`
+
+The same as a command (built with the library; `NANOS3READER_BUILD_TOOLS`):
+
+```bash
+s3put results/ s3://my-bucket/session-run/IR_front_corner_right_83/   # a directory, recursively
+s3put out.bin s3://my-bucket/run/                                      # -> s3://my-bucket/run/out.bin
+s3put -j 16 --part-jobs 8 --multipart-threshold 128 --part-size 32 big/ s3://my-bucket/big/
+```
+
+It prints a line per file and a summary (files, bytes, seconds, Mbps). Exit status 0 when every file was
+uploaded (a warning, still 0, when there was nothing to upload), 1 when any upload failed, 2 for a usage
+error or a source that does not exist or cannot be listed. Credentials, region and endpoint come from the
+environment chain above (`AWS_SESSION_TOKEN` included).
+
 `put` sends the whole body in one signed request (its SHA-256 is part of the signature, so S3 rejects a
 corrupted transfer). A conditional put that is retried after a lost response can report its own earlier
 success as a failed precondition; callers that need exactly-once semantics should re-read the object then.
@@ -216,7 +251,8 @@ default and use the static recipe only where you need the single-binary deployme
 
 ## Scope & non-goals
 
-Reads, listing and whole-object `PUT`. No multipart upload, no `DELETE`, no SSO/assume-role credential
+Reads, listing, `PUT` and multipart uploads of files and directories. No `DELETE` (other than aborting a
+failed multipart upload), no SSO/assume-role credential
 resolution (export to env). If you need a full S3 client, use the AWS SDK; nanos3reader is the small,
 focused one.
 
