@@ -10,3 +10,7 @@ __pycache__/
 *.dylib
 .DS_Store
 compile_commands.json
+
+# ci/build_static.sh
+.static-deps/
+dist/

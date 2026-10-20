@@ -225,6 +225,15 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// --- TLS ------------------------------------------------------------------------------------------
+
+// Where HTTPS requests take their CA certificates from, as a sentence for diagnostics (decided once per
+// process): AWS_CA_BUNDLE, CURL_CA_BUNDLE or SSL_CERT_FILE (a PEM file) and SSL_CERT_DIR (a directory),
+// when set; else, on Linux, the first system bundle found at the usual distribution paths; else the bundle
+// compiled in with the CMake option NANOS3READER_CA_BUNDLE; else libcurl's own default. Every request gets
+// these explicitly, so a statically linked libcurl/OpenSSL does not depend on the paths compiled into it.
+std::string tls_ca_source();
+
 // --- Disk-resident LRU block cache -----------------------------------------------------------------
 
 // Optional process-global cache that persists fetched, read-ahead-aligned blocks as flat files on local

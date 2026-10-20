@@ -161,3 +161,58 @@ jobs:
       - name: S3 server log (on failure)
         if: failure()
         run: cat moto.log || true
+
+  static:
+    # A statically linked s3put / s3cat / libnanos3reader.a (libcurl, OpenSSL, zlib static; only glibc shared;
+    # built against glibc 2.17), tested in vanilla images that have no CA certificates installed.
+    runs-on: ubuntu-latest
+    name: static-linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the static dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            .static-deps/src
+            .static-deps/prefix
+          key: static-deps-${{ hashFiles('ci/build_static.sh') }}
+
+      - name: Build (manylinux2014, glibc 2.17)
+        run: |
+          mkdir -p .static-deps dist
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/.static-deps":/deps -v "$PWD/dist":/out \
+            quay.io/pypa/manylinux2014_x86_64 bash /src/ci/build_static.sh
+          sudo chown -R "$(id -u):$(id -g)" .static-deps dist
+
+      - name: Start an S3 server with TLS (moto, test CA)
+        run: |
+          mkdir -p tls && cd tls
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 2 -subj "/CN=nanos3reader CI CA"
+          openssl req -newkey rsa:2048 -nodes -keyout srv.key -out srv.csr -subj "/CN=127.0.0.1"
+          printf "subjectAltName=IP:127.0.0.1,DNS:localhost\n" > ext.cnf
+          openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out srv.pem -days 2 -extfile ext.cnf
+          python -m pip install --quiet "moto[server]==5.2.4"
+          nohup moto_server -H 127.0.0.1 -p 9443 -c "$PWD/srv.pem" -k "$PWD/srv.key" > ../moto-tls.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS --cacert ca.pem -o /dev/null https://127.0.0.1:9443/ && break; sleep 1; done
+          AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing AWS_DEFAULT_REGION=us-east-1 \
+            aws --endpoint-url https://127.0.0.1:9443 --ca-bundle ca.pem s3 mb s3://static-it
+
+      - name: Test in vanilla images (no ca-certificates)
+        run: |
+          for img in ubuntu:18.04 ubuntu:20.04 ubuntu:22.04 debian:12; do
+            echo "::group::$img"
+            docker run --rm --network host -v "$PWD/dist":/bin-under-test:ro -v "$PWD/tls":/tls:ro \
+              -v "$PWD/ci":/ci:ro -e ENDPOINT=https://127.0.0.1:9443 -e BUCKET=static-it -e PUBLIC_TLS=1 \
+              "$img" sh /ci/test_static.sh
+            echo "::endgroup::"
+          done
+
+      - name: S3 server log (on failure)
+        if: failure()
+        run: cat moto-tls.log || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanos3reader-static-linux-x86_64
+          path: dist/*.tar.gz

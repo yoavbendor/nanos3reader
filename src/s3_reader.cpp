@@ -35,6 +35,11 @@
 #endif
 
 namespace nanos3reader {
+
+// The CA bundle compiled in with NANOS3READER_CA_BUNDLE (src/ca_bundle_none.cpp when there is none: size 0).
+const char* embedded_ca_bundle();
+std::size_t embedded_ca_bundle_size();
+
 namespace s3v4 {
 
 namespace {
@@ -317,6 +322,122 @@ std::string env_or(const char* name, const std::string& fallback) {
     return (v != nullptr && v[0] != '\0') ? std::string(v) : fallback;
 }
 
+// --- TLS trust anchors -------------------------------------------------------------------------------
+// Where the CA certificates come from, decided once per process and handed to libcurl explicitly, so a
+// statically linked libcurl/OpenSSL does not depend on the CA paths compiled into it (which a vanilla image
+// may not have). In order: AWS_CA_BUNDLE, CURL_CA_BUNDLE, SSL_CERT_FILE (a PEM file) and SSL_CERT_DIR (a
+// hashed directory); else, on Linux, the first non-empty system bundle at the usual distribution paths;
+// else the bundle compiled in with NANOS3READER_CA_BUNDLE (when there is one); else libcurl's own default.
+struct CaConfig {
+    std::string file;
+    std::string dir;
+    bool embedded = false;
+    std::string source;  // for diagnostics
+};
+
+bool non_empty_file(const std::string& path) {
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec) && std::filesystem::file_size(path, ec) > 0 && !ec;
+}
+
+const CaConfig& ca_config() {
+    static const CaConfig config = [] {
+        CaConfig c;
+        for (const char* var : {"AWS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"}) {
+            const std::string v = env_or(var, "");
+            if (!v.empty()) {
+                c.file = v;
+                c.source = std::string(var) + "=" + v;
+                break;
+            }
+        }
+        const std::string dir = env_or("SSL_CERT_DIR", "");
+        if (!dir.empty()) {
+            c.dir = dir;
+            c.source += (c.source.empty() ? "" : ", ") + std::string("SSL_CERT_DIR=") + dir;
+        }
+        if (!c.source.empty()) {
+            return c;
+        }
+#if defined(__linux__)
+        for (const char* path : {"/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Arch, Gentoo
+                                 "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  // RHEL / Fedora 7+
+                                 "/etc/pki/tls/certs/ca-bundle.crt",                   // RHEL / Fedora 6
+                                 "/etc/ssl/ca-bundle.pem",                             // openSUSE
+                                 "/etc/ssl/cert.pem",                                  // Alpine
+                                 "/etc/pki/tls/cacert.pem"}) {                         // OpenELEC
+            if (non_empty_file(path)) {
+                c.file = path;
+                c.source = std::string("system bundle ") + path;
+                return c;
+            }
+        }
+#endif
+        if (embedded_ca_bundle_size() != 0) {
+            c.embedded = true;
+            c.source = "the bundle compiled in (NANOS3READER_CA_BUNDLE)";
+            return c;
+        }
+        c.source = "libcurl's built-in default (none of the variables or system bundles was found)";
+        return c;
+    }();
+    return config;
+}
+
+// The compiled-in bundle as a file, for a libcurl without CURLOPT_CAINFO_BLOB (before 7.77, or a TLS backend
+// without it): written once per process to a private temporary file. Empty when it cannot be written.
+const std::string& embedded_ca_file() {
+    static const std::string path = []() -> std::string {
+        std::error_code ec;
+        const auto dir = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            return "";
+        }
+        const auto file = dir / ("nanos3reader-ca-" + std::to_string(embedded_ca_bundle_size()) + "-" +
+                                 std::to_string(static_cast<unsigned long long>(
+                                     std::chrono::steady_clock::now().time_since_epoch().count())) + ".pem");
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out.write(embedded_ca_bundle(), static_cast<std::streamsize>(embedded_ca_bundle_size()));
+        out.close();
+        return out ? file.string() : std::string();
+    }();
+    return path;
+}
+
+// Point `h` at the CA certificates (after every curl_easy_reset, which clears them).
+void apply_tls_options(CURL* h) {
+    const CaConfig& c = ca_config();
+    if (!c.file.empty()) {
+        curl_easy_setopt(h, CURLOPT_CAINFO, c.file.c_str());
+    }
+    if (!c.dir.empty()) {
+        curl_easy_setopt(h, CURLOPT_CAPATH, c.dir.c_str());
+    }
+    if (c.embedded) {
+        bool set = false;
+#if LIBCURL_VERSION_NUM >= 0x074D00  // CURLOPT_CAINFO_BLOB: curl 7.77.0
+        curl_blob blob;
+        blob.data = const_cast<char*>(embedded_ca_bundle());
+        blob.len = embedded_ca_bundle_size();
+        blob.flags = CURL_BLOB_NOCOPY;  // static storage: no copy per request
+        set = curl_easy_setopt(h, CURLOPT_CAINFO_BLOB, &blob) == CURLE_OK;
+#endif
+        if (!set && !embedded_ca_file().empty()) {
+            curl_easy_setopt(h, CURLOPT_CAINFO, embedded_ca_file().c_str());
+        }
+    }
+}
+
+// libcurl's message for `rc`, with where the CA certificates came from when TLS verification failed.
+std::string curl_error_text(CURLcode rc) {
+    std::string msg = curl_easy_strerror(rc);
+    if (rc == CURLE_PEER_FAILED_VERIFICATION || rc == CURLE_SSL_CACERT_BADFILE) {
+        msg += " (CA certificates: " + ca_config().source +
+               "; set SSL_CERT_FILE or AWS_CA_BUNDLE to a PEM bundle, or install ca-certificates)";
+    }
+    return msg;
+}
+
 std::string trim_ws(const std::string& s) {
     const auto b = s.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) {
@@ -463,6 +584,7 @@ bool http_metadata(const std::string& url, const std::vector<std::string>& heade
         hdr = curl_slist_append(hdr, h.c_str());
     }
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    apply_tls_options(c);
     if (put) {
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
     }
@@ -1181,6 +1303,7 @@ private:
 
             curl_easy_reset(curl_);  // preserves the live connection + DNS/TLS caches (keep-alive)
             curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+            apply_tls_options(curl_);
             curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L);
             curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
             curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, &write_to_vector);
@@ -1239,7 +1362,7 @@ private:
             }
 
             if (rc != CURLE_OK) {
-                fail(std::string("S3 GET transport error: ") + curl_easy_strerror(rc));
+                fail(std::string("S3 GET transport error: ") + curl_error_text(rc));
             } else {
                 std::string body(window_.begin(), window_.end());
                 if (body.size() > 512) {
@@ -1795,6 +1918,7 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         sink.dst_cap = call.dst_cap;
         curl_easy_reset(h);
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        apply_tls_options(h);
         Upload upload;
         upload.data = call.body;
         upload.file = call.body_file;
@@ -1877,7 +2001,7 @@ std::string transfer_failure(const std::string& shown, const Reply& r) {
     if (r.overflow) {
         return shown + ": response body is larger than the request asked for";
     }
-    return shown + ": " + curl_easy_strerror(r.rc);
+    return shown + ": " + curl_error_text(r.rc);
 }
 
 }  // namespace
@@ -2550,5 +2674,11 @@ bool S3Client::put_directory(const std::string& dir, const std::string& prefix_u
     }
     return true;
 }
+
+}  // namespace nanos3reader
+
+namespace nanos3reader {
+
+std::string tls_ca_source() { return ca_config().source; }
 
 }  // namespace nanos3reader

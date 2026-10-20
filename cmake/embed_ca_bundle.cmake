@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Generates a C++ source holding a PEM CA bundle as bytes: cmake -DIN=<pem> -DOUT=<cpp> -P embed_ca_bundle.cmake
+file(READ "${IN}" hex HEX)
+string(LENGTH "${hex}" hex_len)
+math(EXPR size "${hex_len} / 2")
+if(size EQUAL 0)
+    message(FATAL_ERROR "NANOS3READER_CA_BUNDLE: ${IN} is empty")
+endif()
+file(READ "${IN}" head LIMIT 4096)
+if(NOT head MATCHES "-----BEGIN CERTIFICATE-----")
+    message(FATAL_ERROR "NANOS3READER_CA_BUNDLE: ${IN} holds no PEM certificate")
+endif()
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
+string(REGEX REPLACE "(0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,0x..,)" "\\1\n" bytes "${bytes}")
+file(WRITE "${OUT}.tmp" "// Generated from ${IN} by cmake/embed_ca_bundle.cmake. Do not edit.\n#include <cstddef>\nnamespace nanos3reader {\nnamespace {\nconst unsigned char kBundle[] = {\n${bytes}0x00};\n}\nconst char* embedded_ca_bundle() { return reinterpret_cast<const char*>(kBundle); }\nstd::size_t embedded_ca_bundle_size() { return ${size}; }\n}  // namespace nanos3reader\n")
+file(COPY_FILE "${OUT}.tmp" "${OUT}" ONLY_IF_DIFFERENT)
+file(REMOVE "${OUT}.tmp")

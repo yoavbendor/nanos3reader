@@ -249,6 +249,27 @@ curl's well-supported small TLS backends are **mbedTLS** and **wolfSSL** (not Be
 stack you vendor statically is a stack whose CVEs you must track and re-release — prefer system libs by
 default and use the static recipe only where you need the single-binary deployment.
 
+## Prebuilt static binaries & CA certificates
+
+CI builds a static package (`ci/build_static.sh`, in manylinux2014): `s3put`, `s3cat`, `libnanos3reader.a`
+plus the static `libcurl.a`/`libssl.a`/`libcrypto.a`/`libz.a` it needs, and headers. Only glibc stays
+shared (floor **GLIBC_2.17**); libstdc++/libgcc are linked in. It is tested in vanilla `ubuntu:18.04`,
+`20.04`, `22.04` and `debian:12` images **with no `ca-certificates` installed** (`ci/test_static.sh`),
+and the tarball is uploaded as the `static-linux-x86_64` workflow artifact.
+
+A static OpenSSL only looks at compiled-in CA paths, so nanos3reader hands libcurl its CA certificates
+explicitly, first match wins:
+
+1. `AWS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` (PEM file), `SSL_CERT_DIR` (hashed directory)
+2. the system bundle (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, ...)
+3. the bundle compiled in with `-DNANOS3READER_CA_BUNDLE=cacert.pem` (the static package embeds
+   Mozilla's, from curl.se/ca)
+4. libcurl's own default
+
+`s3put --tls-info` (and `nanos3reader::tls_ca_source()`) says which one is in use; a certificate error
+names the source and how to override it. Linking the library into another static binary:
+`libnanos3reader.a libcurl.a libssl.a libcrypto.a libz.a -lpthread -ldl`.
+
 ## Scope & non-goals
 
 Reads, listing, `PUT` and multipart uploads of files and directories. No `DELETE` (other than aborting a
