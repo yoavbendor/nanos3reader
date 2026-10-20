@@ -185,6 +185,10 @@ jobs:
             quay.io/pypa/manylinux2014_x86_64 bash /src/ci/build_static.sh
           sudo chown -R "$(id -u):$(id -g)" .static-deps dist
 
+      - uses: actions/setup-python@v5  # the runner's system python has a broken pyOpenSSL for moto
+        with:
+          python-version: "3.12"
+
       - name: Start an S3 server with TLS (moto, test CA)
         run: |
           mkdir -p tls && cd tls
