@@ -2368,6 +2368,45 @@ bool S3Client::put(const std::string& uri, const std::uint8_t* data, std::size_t
     return true;
 }
 
+bool S3Client::remove(const std::string& uri, std::string& error, bool* not_found) {
+    error.clear();
+    if (not_found != nullptr) {
+        *not_found = false;
+    }
+    std::string bucket;
+    std::string key;
+    if (!split_s3_uri(uri, true, bucket, key, error)) {
+        return false;
+    }
+    if (!impl_->refusal.empty()) {
+        error = uri + ": " + impl_->refusal;
+        return false;
+    }
+    Call call;
+    call.method = "DELETE";
+    call.bucket = bucket;
+    call.key = key;
+    Reply r;
+    if (!run_request(impl_->cfg, impl_->has_fixed_creds ? &impl_->fixed_creds : nullptr, call, r, error)) {
+        return false;
+    }
+    if (r.overflow || r.rc != CURLE_OK) {
+        error = transfer_failure(uri, r);
+        return false;
+    }
+    if (r.code == 404) {
+        if (not_found != nullptr) {
+            *not_found = true;
+        }
+        return true;
+    }
+    if (r.code != 204 && r.code != 200) {
+        error = http_failure(uri, r);
+        return false;
+    }
+    return true;
+}
+
 }  // namespace nanos3reader
 
 // --- Uploading files and directories -----------------------------------------------------------------

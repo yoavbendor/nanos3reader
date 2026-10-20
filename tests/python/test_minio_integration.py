@@ -126,3 +126,16 @@ def test_put_errors(client):
         client.put(f"s3://{bucket}-missing-{os.getpid()}/x", b"data")
     with pytest.raises(S3Error):
         client.put("not-a-uri", b"data")
+
+
+@needs_put_prefix
+def test_remove(client, key_prefix: str):
+    import nanos3reader
+
+    uri = key_prefix + "obj.bin"
+    client.put(uri, b"x")
+    assert client.head(uri) == 1
+    client.remove(uri)
+    with pytest.raises(nanos3reader.S3Error):
+        client.head(uri)
+    client.remove(uri)  # a missing object: not an error

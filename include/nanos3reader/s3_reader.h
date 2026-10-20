@@ -202,6 +202,10 @@ public:
     bool put(const std::string& uri, const std::uint8_t* data, std::size_t size, const PutOptions& options,
              std::string* etag, std::string& error, bool* precondition_failed = nullptr);
 
+    // Delete one object (a DELETE). S3 answers 204 whether or not the key existed, so a missing object is
+    // success; `not_found` (when non-null) is set when the store said 404 (some S3-compatible stores do).
+    bool remove(const std::string& uri, std::string& error, bool* not_found = nullptr);
+
     // Upload a local file to `uri`, streamed from disk (never held whole in memory): one PUT below
     // options.multipart_threshold, else a multipart upload (aborted on failure, so no parts are left
     // behind). `etag` receives the object's ETag when non-null. The file must not change while it is sent;

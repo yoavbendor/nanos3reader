@@ -176,6 +176,19 @@ PYBIND11_MODULE(_nanos3reader, m) {
             py::arg("uri"), py::arg("data"), py::arg("content_type") = "", py::arg("if_none_match") = false,
             py::arg("if_match") = "")
         .def(
+            "remove",
+            [](nanos3reader::S3Client& client, const std::string& uri) {
+                std::string error;
+                bool ok = false;
+                {
+                    py::gil_scoped_release release;
+                    ok = client.remove(uri, error);
+                }
+                if (!ok) throw S3Error(error);
+            },
+            py::arg("uri"),
+            "Delete one object (a missing object is not an error, as on S3).")
+        .def(
             "head",
             [](nanos3reader::S3Client& client, const std::string& uri) {
                 std::uint64_t size = 0;
