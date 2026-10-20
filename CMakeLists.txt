@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nanos3reader VERSION 0.3.0 LANGUAGES CXX)
+project(nanos3reader VERSION 0.4.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------------------------------
 # nanos3reader — a minimal, read-only S3 range reader (seekable std::istream over HTTP(S) range GETs +
@@ -26,6 +26,7 @@ endif()
 
 option(NANOS3READER_BUILD_TESTS    "Build tests (SigV4 known-answer test)" ${NANOS3READER_TOP_LEVEL})
 option(NANOS3READER_BUILD_EXAMPLES "Build the s3cat example"               ${NANOS3READER_TOP_LEVEL})
+option(NANOS3READER_BUILD_TOOLS    "Build the s3put upload tool"           ${NANOS3READER_TOP_LEVEL})
 # The MinIO integration test needs a live S3-compatible endpoint (CI spins one up), so it is off by
 # default. When built it still self-skips at run time unless NANOS3READER_IT_URI / _EXPECT are set.
 option(NANOS3READER_BUILD_INTEGRATION_TESTS
@@ -65,6 +66,13 @@ if(NANOS3READER_BUILD_EXAMPLES)
     target_link_libraries(s3cat PRIVATE nanos3reader::nanos3reader)
 endif()
 
+# --- tools --------------------------------------------------------------------------------------
+if(NANOS3READER_BUILD_TOOLS)
+    add_executable(s3put tools/s3put.cpp)
+    target_link_libraries(s3put PRIVATE nanos3reader::nanos3reader)
+    target_compile_features(s3put PRIVATE cxx_std_17)
+endif()
+
 # --- tests --------------------------------------------------------------------------------------
 if(NANOS3READER_BUILD_TESTS)
     enable_testing()
@@ -76,7 +84,8 @@ if(NANOS3READER_BUILD_TESTS)
     # CMake marks it skipped) unless NANOS3READER_IT_URI / NANOS3READER_IT_EXPECT are set in the environment.
     if(NANOS3READER_BUILD_INTEGRATION_TESTS)
         add_executable(nanos3reader_minio_test tests/minio_integration_test.cpp)
-        target_link_libraries(nanos3reader_minio_test PRIVATE nanos3reader::nanos3reader)
+        find_package(Threads REQUIRED)
+        target_link_libraries(nanos3reader_minio_test PRIVATE nanos3reader::nanos3reader Threads::Threads)
         add_test(NAME minio_integration COMMAND nanos3reader_minio_test)
         set_tests_properties(minio_integration PROPERTIES SKIP_RETURN_CODE 77)
     endif()
@@ -101,6 +110,11 @@ if(NANOS3READER_BUILD_PYTHON_BINDINGS)
     # Place the extension next to the pure-Python package for local/editable installs.
     set_target_properties(_nanos3reader PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bindings/nanos3reader)
+    # A wheel (scikit-build-core, `pip install .`) installs it into the package; without this rule only the
+    # pure-Python files were packaged and `import nanos3reader` failed outside an editable install.
+    if(SKBUILD)
+        install(TARGETS _nanos3reader LIBRARY DESTINATION nanos3reader)
+    endif()
 endif()
 
 # --- install / find_package(nanos3reader) -------------------------------------------------------
@@ -111,6 +125,9 @@ if(NANOS3READER_TOP_LEVEL)
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
     install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    if(NANOS3READER_BUILD_TOOLS)
+        install(TARGETS s3put RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
     install(EXPORT nanos3readerTargets
             FILE nanos3readerTargets.cmake
             NAMESPACE nanos3reader::

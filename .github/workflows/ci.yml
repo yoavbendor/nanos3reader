@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     name: minio-integration
     env:
-      # MinIO root creds double as the AWS credentials the reader resolves from the environment.
+      # Any credentials work against the local S3 server; they double as what the reader resolves from the environment.
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
@@ -44,17 +44,21 @@ jobs:
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y cmake g++ libcurl4-openssl-dev libssl-dev
 
-      - name: Start MinIO
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start the S3 server (moto)
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e "MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID}" \
-            -e "MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY}" \
-            minio/minio:latest server /data
-          # Wait for the S3 endpoint to report ready before seeding it.
+          # minio/minio can no longer be pulled from Docker Hub ("pull access denied"); moto's server speaks
+          # the same S3 API (range GETs, HEAD, ListObjectsV2), accepts any credentials and needs no Docker.
+          python -m pip install --quiet "moto[server]==5.2.4"
+          nohup moto_server -H 127.0.0.1 -p 9000 > moto.log 2>&1 &
           for i in $(seq 1 30); do
-            if curl -fsS "${AWS_ENDPOINT_URL}/minio/health/ready"; then echo "minio ready"; break; fi
+            if curl -fsS -o /dev/null "${AWS_ENDPOINT_URL}/"; then echo "S3 server ready"; break; fi
             sleep 1
           done
+          curl -fsS -o /dev/null "${AWS_ENDPOINT_URL}/"
 
       - name: Seed test object
         run: |
@@ -63,6 +67,12 @@ jobs:
           head -c 1048576 /dev/urandom > obj.bin
           aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 mb "s3://${BUCKET}"
           aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp obj.bin "s3://${BUCKET}/data/obj.bin"
+          # Listing fixture for the S3Client checks: 1,100 objects f00000.bin..f01099.bin (object i has
+          # 1 + i % 13 bytes; more than one 1,000-key page) plus sub/one.bin (3 bytes).
+          mkdir -p listing/sub
+          for i in $(seq 0 1099); do head -c $((1 + i % 13)) /dev/zero > "listing/$(printf 'f%05d.bin' "$i")"; done
+          head -c 3 /dev/zero > listing/sub/one.bin
+          aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 sync listing "s3://${BUCKET}/listing/"
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNANOS3READER_BUILD_INTEGRATION_TESTS=ON
@@ -75,11 +85,31 @@ jobs:
           NANOS3READER_IT_URI: s3://nanos3reader-it/data/obj.bin
           NANOS3READER_IT_EXPECT: ${{ github.workspace }}/obj.bin
           NANOS3READER_IT_MISSING: s3://nanos3reader-it/data/does-not-exist.bin
+          NANOS3READER_IT_LISTING: s3://nanos3reader-it/listing/
+          NANOS3READER_IT_PUT_PREFIX: s3://nanos3reader-it/put/
         run: ctest --test-dir build --output-on-failure -R minio_integration
 
-      - name: MinIO logs (on failure)
+      - name: s3put (directory upload, same layout as Path.rglob)
+        env:
+          AWS_ALLOW_HTTP: "true"  # moto serves plain HTTP; the client refuses it otherwise
+        run: |
+          mkdir -p tree/"sub dir"/deeper
+          head -c 12000000 /dev/urandom > tree/big.bin            # multipart with --multipart-threshold 8
+          echo one > tree/a.txt
+          echo two > "tree/sub dir/b c.txt"
+          : > tree/sub\ dir/deeper/empty.bin
+          ./build/s3put --multipart-threshold 8 --part-size 5 tree "s3://${BUCKET}/s3put/run1/"
+          ./build/s3put tree/a.txt "s3://${BUCKET}/s3put/single/"
+          aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp --recursive "s3://${BUCKET}/s3put/run1/" back
+          diff -r tree back
+          test "$(aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 ls --recursive "s3://${BUCKET}/s3put/run1/" | wc -l)" -eq 4
+          aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp "s3://${BUCKET}/s3put/single/a.txt" - | grep -qx one
+          if ./build/s3put tree "s3://${BUCKET}-missing/x/"; then echo "expected a failure"; exit 1; fi
+          if ./build/s3put does-not-exist "s3://${BUCKET}/x/"; then echo "expected a failure"; exit 1; fi
+
+      - name: S3 server log (on failure)
         if: failure()
-        run: docker logs minio || true
+        run: cat moto.log || true
 
   python-integration:
     runs-on: ubuntu-latest
@@ -100,16 +130,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Start MinIO
+      - name: Start the S3 server (moto)
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e "MINIO_ROOT_USER=${AWS_ACCESS_KEY_ID}" \
-            -e "MINIO_ROOT_PASSWORD=${AWS_SECRET_ACCESS_KEY}" \
-            minio/minio:latest server /data
+          # minio/minio can no longer be pulled from Docker Hub ("pull access denied"); moto's server speaks
+          # the same S3 API (range GETs, HEAD, ListObjectsV2), accepts any credentials and needs no Docker.
+          python -m pip install --quiet "moto[server]==5.2.4"
+          nohup moto_server -H 127.0.0.1 -p 9000 > moto.log 2>&1 &
           for i in $(seq 1 30); do
-            if curl -fsS "${AWS_ENDPOINT_URL}/minio/health/ready"; then echo "minio ready"; break; fi
+            if curl -fsS -o /dev/null "${AWS_ENDPOINT_URL}/"; then echo "S3 server ready"; break; fi
             sleep 1
           done
+          curl -fsS -o /dev/null "${AWS_ENDPOINT_URL}/"
 
       - name: Seed test object
         run: |
@@ -124,8 +155,9 @@ jobs:
         env:
           NANOS3READER_IT_URI: s3://nanos3reader-it/data/obj.bin
           NANOS3READER_IT_EXPECT: ${{ github.workspace }}/obj.bin
+          NANOS3READER_IT_PUT_PREFIX: s3://nanos3reader-it/put/
         run: pytest tests/python/test_minio_integration.py -v
 
-      - name: MinIO logs (on failure)
+      - name: S3 server log (on failure)
         if: failure()
-        run: docker logs minio || true
+        run: cat moto.log || true
