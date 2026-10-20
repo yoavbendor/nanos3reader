@@ -90,6 +90,8 @@ jobs:
         run: ctest --test-dir build --output-on-failure -R minio_integration
 
       - name: s3put (directory upload, same layout as Path.rglob)
+        env:
+          AWS_ALLOW_HTTP: "true"  # moto serves plain HTTP; the client refuses it otherwise
         run: |
           mkdir -p tree/"sub dir"/deeper
           head -c 12000000 /dev/urandom > tree/big.bin            # multipart with --multipart-threshold 8
