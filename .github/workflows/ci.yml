@@ -86,6 +86,7 @@ jobs:
           NANOS3READER_IT_EXPECT: ${{ github.workspace }}/obj.bin
           NANOS3READER_IT_MISSING: s3://nanos3reader-it/data/does-not-exist.bin
           NANOS3READER_IT_LISTING: s3://nanos3reader-it/listing/
+          NANOS3READER_IT_PUT_PREFIX: s3://nanos3reader-it/put/
         run: ctest --test-dir build --output-on-failure -R minio_integration
 
       - name: S3 server log (on failure)
@@ -136,6 +137,7 @@ jobs:
         env:
           NANOS3READER_IT_URI: s3://nanos3reader-it/data/obj.bin
           NANOS3READER_IT_EXPECT: ${{ github.workspace }}/obj.bin
+          NANOS3READER_IT_PUT_PREFIX: s3://nanos3reader-it/put/
         run: pytest tests/python/test_minio_integration.py -v
 
       - name: S3 server log (on failure)

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Yoav Bendor
 
-// nanos3reader — a minimal, read-only S3 range reader. It opens s3:// objects as seekable,
-// read-ahead-buffered std::istreams over HTTP(S) range GETs with AWS SigV4 signing, using nothing but
-// libcurl + a small SHA-256 (OpenSSL or bundled) — no AWS SDK. Read/GET only, by design.
+// nanos3reader — a minimal S3 client. It opens s3:// objects as seekable, read-ahead-buffered std::istreams
+// over HTTP(S) range GETs with AWS SigV4 signing, using nothing but libcurl + a small SHA-256 (OpenSSL or
+// bundled) — no AWS SDK. S3Client adds HEAD, range reads, listing and a single-request PUT (whole objects up
+// to 5 GiB, optionally conditional); there is no multipart upload.
 //
 // The SigV4 signing primitives are declared here (not just in the .cpp) so they can be unit-tested against
 // AWS's published signature test vectors with no network.
@@ -14,7 +15,7 @@
 // Version, exposed so consumers can feature-gate at compile time (e.g. the disk block cache below was
 // added in 0.2.0). NANOS3READER_VERSION is a single comparable integer: MAJOR*10000 + MINOR*100 + PATCH.
 #define NANOS3READER_VERSION_MAJOR 0
-#define NANOS3READER_VERSION_MINOR 4
+#define NANOS3READER_VERSION_MINOR 5
 #define NANOS3READER_VERSION_PATCH 0
 #define NANOS3READER_VERSION \
     (NANOS3READER_VERSION_MAJOR * 10000 + NANOS3READER_VERSION_MINOR * 100 + NANOS3READER_VERSION_PATCH)
@@ -40,6 +41,7 @@ std::string hex_encode(const unsigned char* data, std::size_t len);
 
 // Hex SHA-256 of a payload.
 std::string sha256_hex(const std::string& payload);
+std::string sha256_hex(const unsigned char* data, std::size_t len);
 
 // HMAC-SHA256(key, msg) as raw bytes.
 std::vector<unsigned char> hmac_sha256(const std::vector<unsigned char>& key, const std::string& msg);
@@ -98,7 +100,7 @@ private:
     std::shared_ptr<const s3detail::Config> config_;
 };
 
-// --- Object-store client (HEAD, range GET, ListObjectsV2) -------------------------------------------
+// --- Object-store client (HEAD, range GET, ListObjectsV2, PUT) --------------------------------------
 
 // Per-client settings. An empty string falls back to the environment chain used by S3MinStreamFactory
 // (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, shared profile files, ECS, IMDS;
@@ -110,6 +112,15 @@ struct ClientOptions {
     std::string region;
     std::string endpoint;        // e.g. "http://127.0.0.1:9000"; non-empty selects path-style addressing
     bool allow_http = false;     // an http:// endpoint (explicit or from AWS_ENDPOINT_URL) is refused unless set
+};
+
+// Options for S3Client::put. The conditional headers make a put an atomic create or compare-and-swap, as
+// S3 implements them: if_none_match writes only when the key does not exist yet; if_match only when the
+// object's current ETag equals it. A failed condition is reported through `precondition_failed`.
+struct PutOptions {
+    std::string content_type;    // empty: application/octet-stream
+    bool if_none_match = false;  // send If-None-Match: * (create only)
+    std::string if_match;        // non-empty: send If-Match: <etag> (replace only that version)
 };
 
 struct ObjectInfo {
@@ -145,6 +156,15 @@ public:
     // Without a delimiter every object under the prefix is returned and `common_prefixes` is left empty.
     bool list(const std::string& prefix_uri, const std::string& delimiter, std::vector<ObjectInfo>& objects,
               std::vector<std::string>& common_prefixes, std::string& error);
+
+    // Write a whole object from memory in one signed PUT (S3 allows up to 5 GiB this way; larger objects
+    // need a multipart upload, which this client does not do). The body's SHA-256 is signed, so S3 rejects a
+    // corrupted transfer. On success `etag` (when non-null) receives the new object's ETag, quotes included.
+    // Retries as every request does; note that a conditional put retried after a lost response can report
+    // its own earlier success as a failed precondition. On a failed condition (HTTP 412) the call returns
+    // false with `*precondition_failed` set (when non-null) and `error` naming it.
+    bool put(const std::string& uri, const std::uint8_t* data, std::size_t size, const PutOptions& options,
+             std::string* etag, std::string& error, bool* precondition_failed = nullptr);
 
 private:
     struct Impl;

@@ -4,8 +4,10 @@ A minimal, **read-only S3 range reader** for C++. It opens `s3://bucket/key` (an
 store — MinIO, R2, …) as a **seekable, read-ahead-buffered `std::istream`** backed by libcurl range
 `GET`s and AWS SigV4 signing — using nothing but **libcurl + a small SHA-256**. No AWS SDK.
 
-It does one thing well: fetch byte ranges out of S3 objects, with the full AWS credential chain. It is
-**read-only / `GET`-only** by design — no `PUT`, multipart, or `LIST`.
+It does one thing well: fetch byte ranges out of S3 objects, with the full AWS credential chain. Beside the
+stream, `S3Client` does `HEAD`, exact range reads, `ListObjectsV2` and a **single-request `PUT`** of a whole
+object (up to 5 GiB, optionally conditional: create-only or compare-and-swap on the ETag). There is no
+multipart upload.
 
 ```cpp
 #include "nanos3reader/s3_reader.h"
@@ -40,7 +42,10 @@ connection per object, so streaming many small ranges from a few objects is fast
 - **S3-compatible stores**: set `AWS_ENDPOINT_URL` (e.g. `http://localhost:9000`) for path-style MinIO/etc.
 - **Optional disk block cache**: persist fetched blocks to local disk so re-reads skip the network
   entirely (see *Disk block cache* below).
-- **Python bindings**: read/seek API with the same credential chain (see *Python* below).
+- **`S3Client`**: `head`, `read_range`, `list` and `put` (see *Object client* below), thread-safe, with
+  retries on 5xx / 429 / transient transport errors.
+- **Python bindings**: read/seek API and `Client` (`put`, `head`, `read_range`) with the same credential
+  chain (see *Python* below).
 
 ## Build & use
 
@@ -83,6 +88,35 @@ target_link_libraries(your_app PRIVATE nanos3reader::nanos3reader)
 | `AWS_ENDPOINT_URL` | Custom endpoint (MinIO etc.); switches to path-style addressing. |
 | `AWS_MAX_ATTEMPTS` | Tries per range GET (default 3; full-jitter backoff on transient failures). |
 
+## Object client
+
+```cpp
+#include "nanos3reader/s3_reader.h"
+
+nanos3reader::S3Client client;  // or S3Client(ClientOptions{...}) for explicit keys / endpoint / region
+std::string err, etag;
+const std::string body = "hello";
+if (!client.put("s3://my-bucket/greeting.txt", reinterpret_cast<const std::uint8_t*>(body.data()),
+                body.size(), nanos3reader::PutOptions{}, &etag, err)) {
+    /* err: "s3://my-bucket/greeting.txt: HTTP 403 AccessDenied", ... */
+}
+
+// Atomic create: fails with precondition_failed = true when the key already exists.
+nanos3reader::PutOptions create;
+create.if_none_match = true;
+create.content_type = "application/json";
+bool exists = false;
+client.put("s3://my-bucket/v1.json", data, size, create, nullptr, err, &exists);
+
+// Compare-and-swap: replace only the version whose ETag you read.
+nanos3reader::PutOptions swap;
+swap.if_match = etag;
+```
+
+`put` sends the whole body in one signed request (its SHA-256 is part of the signature, so S3 rejects a
+corrupted transfer). A conditional put that is retried after a lost response can report its own earlier
+success as a failed precondition; callers that need exactly-once semantics should re-read the object then.
+
 ## Python
 
 Python bindings wrap the same read/seek path and credential chain. Build from the repo root:
@@ -105,9 +139,23 @@ with factory.open("s3://my-bucket/object", read_ahead=4096) as reader:
     chunk = reader.read(4096)
 ```
 
+```python
+from nanos3reader import Client, PreconditionFailed
+
+client = Client()  # or Client(access_key_id=..., secret_access_key=..., region=..., endpoint=..., allow_http=...)
+etag = client.put("s3://my-bucket/blob.bin", b"\x00" * 1024, content_type="application/octet-stream")
+client.put("s3://my-bucket/v1.json", b'{"v": 1}', if_none_match=True)  # PreconditionFailed if it exists
+client.put("s3://my-bucket/v1.json", b'{"v": 2}', if_match=etag_of_v1)  # PreconditionFailed if changed
+size = client.head("s3://my-bucket/blob.bin")
+first = client.read_range("s3://my-bucket/blob.bin", 0, 16)
+```
+
+Failures raise `nanos3reader.S3Error` (`PreconditionFailed` is a subclass). Requests release the GIL.
+
 Example: `examples/s3cat.py` streams a byte range to stdout (the Python equivalent of `examples/s3cat.cpp`).
-CI runs `tests/python/test_minio_integration.py` against MinIO when `NANOS3READER_IT_URI` /
-`NANOS3READER_IT_EXPECT` are set.
+CI runs `tests/python/test_minio_integration.py` against an S3 server (moto) when `NANOS3READER_IT_URI` /
+`NANOS3READER_IT_EXPECT` are set; the `put` tests also need `NANOS3READER_IT_PUT_PREFIX`, a prefix they may
+write under.
 
 | CMake option | Purpose |
 |---|---|
@@ -168,8 +216,9 @@ default and use the static recipe only where you need the single-binary deployme
 
 ## Scope & non-goals
 
-Read-only, `GET`-only. No writes, no `LIST`, no SSO/assume-role credential resolution (export to env).
-If you need a full S3 client, use the AWS SDK; nanos3reader is the small, focused reader.
+Reads, listing and whole-object `PUT`. No multipart upload, no `DELETE`, no SSO/assume-role credential
+resolution (export to env). If you need a full S3 client, use the AWS SDK; nanos3reader is the small,
+focused one.
 
 ## License
 

@@ -102,6 +102,11 @@ if(NANOS3READER_BUILD_PYTHON_BINDINGS)
     # Place the extension next to the pure-Python package for local/editable installs.
     set_target_properties(_nanos3reader PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bindings/nanos3reader)
+    # A wheel (scikit-build-core, `pip install .`) installs it into the package; without this rule only the
+    # pure-Python files were packaged and `import nanos3reader` failed outside an editable install.
+    if(SKBUILD)
+        install(TARGETS _nanos3reader LIBRARY DESTINATION nanos3reader)
+    endif()
 endif()
 
 # --- install / find_package(nanos3reader) -------------------------------------------------------

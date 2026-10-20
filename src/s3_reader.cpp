@@ -174,8 +174,13 @@ std::string hex_encode(const unsigned char* data, std::size_t len) {
 }
 
 std::string sha256_hex(const std::string& payload) {
+    return sha256_hex(reinterpret_cast<const unsigned char*>(payload.data()), payload.size());
+}
+
+std::string sha256_hex(const unsigned char* data, std::size_t len) {
     unsigned char digest[32];
-    sha256_raw(reinterpret_cast<const unsigned char*>(payload.data()), payload.size(), digest);
+    static const unsigned char kEmpty = 0;
+    sha256_raw(len == 0 ? &kEmpty : data, len, digest);
     return hex_encode(digest, sizeof digest);
 }
 
@@ -1534,13 +1539,18 @@ bool parse_list_page(const std::string& xml, std::vector<ObjectInfo>& objects, s
 // One signed request. `dst` receives the body of a 206 for a range read (exactly `dst_cap` bytes at most);
 // every other body is collected into the reply's text.
 struct Call {
-    std::string method;  // "GET" or "HEAD"
+    std::string method;  // "GET", "HEAD" or "PUT"
     std::string bucket;
     std::string key;     // "" for a listing (bucket root)
     std::string query;   // canonical, already encoded; "" when none
     std::string range;   // "bytes=a-b" or ""
     std::uint8_t* dst = nullptr;
     std::size_t dst_cap = 0;
+    // PUT: the body, sent whole (its SHA-256 is signed), and headers sent with it unsigned
+    // ("Content-Type: ...", "If-None-Match: *", ...).
+    const std::uint8_t* body = nullptr;
+    std::size_t body_len = 0;
+    std::vector<std::string> extra_headers;
 };
 
 struct Reply {
@@ -1550,6 +1560,7 @@ struct Reply {
     std::size_t dst_len = 0;
     std::int64_t content_length = -1;  // HEAD only
     std::string text;
+    std::string etag;  // the ETag response header, quotes included, when one was sent
 };
 
 // Write-callback state, one per attempt.
@@ -1584,6 +1595,39 @@ std::size_t sink_write(char* ptr, std::size_t size, std::size_t nmemb, void* use
     return n;
 }
 
+// Read-callback state for a PUT body: the whole body from memory, restarted on every attempt.
+struct Upload {
+    const std::uint8_t* data = nullptr;
+    std::size_t len = 0;
+    std::size_t at = 0;
+};
+
+std::size_t upload_read(char* buffer, std::size_t size, std::size_t nitems, void* userdata) {
+    auto* u = static_cast<Upload*>(userdata);
+    const std::size_t n = std::min(size * nitems, u->len - u->at);
+    if (n != 0) {
+        std::memcpy(buffer, u->data + u->at, n);
+        u->at += n;
+    }
+    return n;
+}
+
+// Header callback: keeps the ETag header's value.
+std::size_t capture_etag(char* buffer, std::size_t size, std::size_t nitems, void* userdata) {
+    const std::size_t n = size * nitems;
+    std::string line(buffer, n);
+    const auto lower = [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); };
+    if (line.size() > 5 && lower(line[0]) == 'e' && lower(line[1]) == 't' && lower(line[2]) == 'a' &&
+        lower(line[3]) == 'g' && line[4] == ':') {
+        std::string value = line.substr(5);
+        const auto first = value.find_first_not_of(" \t");
+        const auto last = value.find_last_not_of(" \t\r\n");
+        *static_cast<std::string*>(userdata) =
+            first == std::string::npos ? std::string() : value.substr(first, last - first + 1);
+    }
+    return n;
+}
+
 // Sends `call` with SigV4 signing, retrying 5xx, 429 and transport errors that libcurl marks retriable.
 // Returns false only when no request could be made (no credentials, no handle); otherwise `reply` holds the
 // last attempt's outcome, and the caller interprets it.
@@ -1611,12 +1655,18 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         error = shown + ": failed to initialize libcurl handle";
         return false;
     }
+    const bool put = call.method == "PUT";
+    // A PUT signs its body's SHA-256 (S3 checks it); reads send no body and sign UNSIGNED-PAYLOAD.
+    std::string payload_hash = "UNSIGNED-PAYLOAD";
+    if (put) {
+        payload_hash = s3v4::sha256_hex(call.body, call.body_len);
+    }
 
     for (int attempt = 0;; ++attempt) {
         const std::string amz_date = amz_now();  // fresh per attempt so a backoff never skews the signature
         std::vector<s3v4::Header> sign_headers = {
             {"host", ep.host},
-            {"x-amz-content-sha256", "UNSIGNED-PAYLOAD"},
+            {"x-amz-content-sha256", payload_hash},
             {"x-amz-date", amz_date},
         };
         if (!call.range.empty()) {
@@ -1630,13 +1680,19 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         req.uri = ep.path;
         req.query = call.query;
         req.headers = sign_headers;
-        req.payload_hash = "UNSIGNED-PAYLOAD";
+        req.payload_hash = payload_hash;
         const std::string authz =
             s3v4::build_authorization(req, cred.access_key, cred.secret_key, cfg.region, "s3", amz_date);
 
         curl_slist* hdrs = nullptr;
         hdrs = curl_slist_append(hdrs, ("x-amz-date: " + amz_date).c_str());
-        hdrs = curl_slist_append(hdrs, "x-amz-content-sha256: UNSIGNED-PAYLOAD");
+        hdrs = curl_slist_append(hdrs, ("x-amz-content-sha256: " + payload_hash).c_str());
+        for (const auto& extra : call.extra_headers) {
+            hdrs = curl_slist_append(hdrs, extra.c_str());
+        }
+        if (put) {
+            hdrs = curl_slist_append(hdrs, "Expect:");  // no 100-continue round trip: the body goes at once
+        }
         if (!call.range.empty()) {
             hdrs = curl_slist_append(hdrs, ("Range: " + call.range).c_str());
         }
@@ -1651,8 +1707,17 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         sink.dst_cap = call.dst_cap;
         curl_easy_reset(h);
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        Upload upload{call.body, call.body_len, 0};
+        std::string etag;
         if (call.method == "HEAD") {
             curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+        } else if (put) {
+            curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
+            curl_easy_setopt(h, CURLOPT_READFUNCTION, &upload_read);
+            curl_easy_setopt(h, CURLOPT_READDATA, &upload);
+            curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(call.body_len));
+            curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, &capture_etag);
+            curl_easy_setopt(h, CURLOPT_HEADERDATA, &etag);
         } else {
             curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
         }
@@ -1681,6 +1746,7 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         reply.dst_len = sink.dst_len;
         reply.content_length = static_cast<std::int64_t>(clen);
         reply.text = std::move(sink.text);
+        reply.etag = std::move(etag);
 
         const bool http_retriable = rc == CURLE_OK && (code == 429 || code == 500 || code == 502 ||
                                                        code == 503 || code == 504);  // 503 SlowDown included
@@ -1903,6 +1969,76 @@ bool S3Client::list(const std::string& prefix_uri, const std::string& delimiter,
     }
     objects = std::move(found);
     common_prefixes = std::move(prefixes);
+    return true;
+}
+
+bool S3Client::put(const std::string& uri, const std::uint8_t* data, std::size_t size, const PutOptions& options,
+                   std::string* etag, std::string& error, bool* precondition_failed) {
+    error.clear();
+    if (precondition_failed != nullptr) {
+        *precondition_failed = false;
+    }
+    std::string bucket;
+    std::string key;
+    if (!split_s3_uri(uri, true, bucket, key, error)) {
+        return false;
+    }
+    if (!impl_->refusal.empty()) {
+        error = uri + ": " + impl_->refusal;
+        return false;
+    }
+    if (data == nullptr && size != 0) {
+        error = uri + ": put called with a null body";
+        return false;
+    }
+    constexpr std::uint64_t kMaxSinglePut = std::uint64_t{5} << 30U;  // S3's limit for one PUT
+    if (static_cast<std::uint64_t>(size) > kMaxSinglePut) {
+        error = uri + ": " + std::to_string(size) + " bytes is more than one PUT may carry (5 GiB)";
+        return false;
+    }
+    const auto clean = [](const std::string& v) { return v.find_first_of("\r\n") == std::string::npos; };
+    if (!clean(options.content_type) || !clean(options.if_match)) {
+        error = uri + ": put options must not contain line breaks";
+        return false;
+    }
+    Call call;
+    call.method = "PUT";
+    call.bucket = bucket;
+    call.key = key;
+    call.body = data;
+    call.body_len = size;
+    call.extra_headers.push_back("Content-Type: " +
+                                 (options.content_type.empty() ? std::string("application/octet-stream")
+                                                               : options.content_type));
+    if (options.if_none_match) {
+        call.extra_headers.push_back("If-None-Match: *");
+    }
+    if (!options.if_match.empty()) {
+        call.extra_headers.push_back("If-Match: " + options.if_match);
+    }
+    Reply r;
+    if (!run_request(impl_->cfg, impl_->has_fixed_creds ? &impl_->fixed_creds : nullptr, call, r, error)) {
+        return false;
+    }
+    if (r.overflow || r.rc != CURLE_OK) {
+        error = transfer_failure(uri, r);
+        return false;
+    }
+    if (r.code == 412) {
+        if (precondition_failed != nullptr) {
+            *precondition_failed = true;
+        }
+        error = http_failure(uri, r) + " (precondition failed: " +
+                (options.if_none_match ? std::string("the object exists") : std::string("the ETag differs")) + ")";
+        return false;
+    }
+    if (r.code != 200) {
+        error = http_failure(uri, r);
+        return false;
+    }
+    if (etag != nullptr) {
+        *etag = r.etag;
+    }
     return true;
 }
 

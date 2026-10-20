@@ -12,6 +12,7 @@
 //   NANOS3READER_IT_EXPECT   (required) path to a local file holding byte-identical content
 //   NANOS3READER_IT_MISSING  (optional) s3://bucket/key that does NOT exist (negative test)
 //   NANOS3READER_IT_LISTING  (required) s3://bucket/prefix/ seeded with 1,101 objects (see client_checks)
+//   NANOS3READER_IT_PUT_PREFIX (required) s3://bucket/prefix/ the test may write under (see put_checks)
 //
 // When the required variables are unset the test exits 77, which CMake maps to "skipped" — so a plain
 // `ctest` on a developer box with no MinIO doesn't report a failure.
@@ -22,6 +23,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -279,6 +281,101 @@ void client_checks(const std::string& uri, const std::string& expected, const st
 
 }  // namespace
 
+// S3Client::put: whole objects written and read back, overwrites, the empty object, the conditional forms
+// (If-None-Match: *, If-Match: <etag>) and their precondition failures, and errors for a missing bucket.
+void put_checks(const std::string& prefix) {
+    using nanos3reader::ClientOptions;
+    using nanos3reader::PutOptions;
+    using nanos3reader::S3Client;
+
+    ClientOptions http_ok;
+    http_ok.allow_http = true;
+    S3Client client(http_ok);
+    std::string err;
+    const std::string run = std::to_string(static_cast<unsigned long long>(::getpid())) + "-" +
+                            std::to_string(static_cast<unsigned long long>(std::time(nullptr)));
+    const auto bytes = [](std::size_t n, unsigned seed) {
+        std::vector<std::uint8_t> v(n);
+        for (std::size_t i = 0; i < n; ++i) v[i] = static_cast<std::uint8_t>((i * 131U + seed * 7U) ^ (i >> 5U));
+        return v;
+    };
+    const auto read_back = [&](const std::string& uri, std::vector<std::uint8_t>& out) {
+        std::uint64_t size = 0;
+        if (!client.head(uri, size, err)) return false;
+        out.assign(static_cast<std::size_t>(size), 0);
+        return size == 0 || client.read_range(uri, 0, size, out.data(), err);
+    };
+
+    // A ~3 MiB object (one request), read back byte for byte, with its ETag.
+    const std::string big = prefix + "put-" + run + "/big.bin";
+    const auto body = bytes(3U << 20U, 1);
+    std::string etag;
+    if (!client.put(big, body.data(), body.size(), PutOptions{}, &etag, err)) {
+        fail("put of a 3 MiB object: " + err);
+        return;
+    }
+    if (etag.size() < 2 || etag.front() != '"') fail("put returned no quoted ETag: '" + etag + "'");
+    std::vector<std::uint8_t> got;
+    if (!read_back(big, got) || got != body) fail("3 MiB object read back differs: " + err);
+
+    // Overwrite with other content; the new bytes are read.
+    const auto body2 = bytes(1000, 2);
+    std::string etag2;
+    if (!client.put(big, body2.data(), body2.size(), PutOptions{}, &etag2, err)) fail("overwrite: " + err);
+    if (!read_back(big, got) || got != body2) fail("overwritten object reads its old content: " + err);
+    if (etag2 == etag) fail("an overwrite kept the old ETag");
+
+    // The empty object.
+    const std::string empty = prefix + "put-" + run + "/empty.bin";
+    if (!client.put(empty, nullptr, 0, PutOptions{}, nullptr, err)) fail("put of an empty object: " + err);
+    std::uint64_t size = 1;
+    if (!client.head(empty, size, err) || size != 0) fail("empty object HEAD: " + err);
+
+    // If-None-Match: * creates once, then fails its precondition.
+    const std::string once = prefix + "put-" + run + "/once.json";
+    PutOptions create;
+    create.if_none_match = true;
+    create.content_type = "application/json";
+    const std::string v1 = "{\"version\": 1}";
+    const std::string v2 = "{\"version\": 2}";
+    bool pre = true;
+    std::string once_etag;
+    if (!client.put(once, reinterpret_cast<const std::uint8_t*>(v1.data()), v1.size(), create, &once_etag, err,
+                    &pre) || pre) {
+        fail("conditional create of a new key: " + err);
+    }
+    if (client.put(once, reinterpret_cast<const std::uint8_t*>(v2.data()), v2.size(), create, nullptr, err, &pre)) {
+        fail("conditional create overwrote an existing key");
+    } else if (!pre) {
+        fail("conditional create on an existing key did not report a failed precondition: " + err);
+    }
+    if (!read_back(once, got) || std::string(got.begin(), got.end()) != v1) fail("the first create was replaced");
+
+    // If-Match: a wrong ETag fails; the current one replaces.
+    PutOptions swap;
+    swap.if_match = "\"00000000000000000000000000000000\"";
+    if (client.put(once, reinterpret_cast<const std::uint8_t*>(v2.data()), v2.size(), swap, nullptr, err, &pre)) {
+        fail("If-Match with a wrong ETag replaced the object");
+    } else if (!pre) {
+        fail("If-Match with a wrong ETag did not report a failed precondition: " + err);
+    }
+    swap.if_match = once_etag;
+    if (!client.put(once, reinterpret_cast<const std::uint8_t*>(v2.data()), v2.size(), swap, nullptr, err, &pre)) {
+        fail("If-Match with the current ETag: " + err);
+    }
+    if (!read_back(once, got) || std::string(got.begin(), got.end()) != v2) fail("If-Match did not replace");
+
+    // Errors: a bucket that does not exist names the object and the status; a bad URI fails before any request.
+    const std::string bucket_end = prefix.substr(5, prefix.find('/', 5) - 5);
+    const std::string missing = "s3://" + bucket_end + "-no-such-bucket-" + run + "/x.bin";
+    if (client.put(missing, body2.data(), body2.size(), PutOptions{}, nullptr, err)) {
+        fail("put into a missing bucket succeeded");
+    } else if (err.find(missing) == std::string::npos || err.find("HTTP 404") == std::string::npos) {
+        fail("missing-bucket error lacks the URI or status: " + err);
+    }
+    if (client.put("not-a-uri", body2.data(), body2.size(), PutOptions{}, nullptr, err)) fail("put of a bad URI");
+}
+
 int main() {
     const char* uri_c = env("NANOS3READER_IT_URI");
     const char* expect_c = env("NANOS3READER_IT_EXPECT");
@@ -431,6 +528,13 @@ int main() {
         client_checks(uri, expected, listing);
     } else {
         fail("NANOS3READER_IT_LISTING must name the seeded listing prefix (s3://bucket/listing/)");
+    }
+
+    // 8. S3Client::put under a writable prefix.
+    if (const char* put_prefix = env("NANOS3READER_IT_PUT_PREFIX")) {
+        put_checks(put_prefix);
+    } else {
+        fail("NANOS3READER_IT_PUT_PREFIX must name a prefix the test may write under (s3://bucket/put/)");
     }
 
     if (failures != 0) {
