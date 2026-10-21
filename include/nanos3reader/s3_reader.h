@@ -162,6 +162,7 @@ struct DirectoryUploadStats {
 struct ObjectInfo {
     std::string key;             // full key inside the bucket (the listed prefix is included)
     std::uint64_t size = 0;
+    std::int64_t last_modified_ns = 0;  // LastModified, nanoseconds since the Unix epoch (0 when not reported)
 };
 
 // Thread-safe client for s3:// objects. One instance may be shared by any number of threads; each thread

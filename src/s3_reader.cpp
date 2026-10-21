@@ -1666,6 +1666,36 @@ std::string list_query(const std::string& prefix, const std::string& delimiter, 
     return q;
 }
 
+// ISO 8601 UTC ("2026-10-21T03:47:15.000Z", as ListObjectsV2 reports LastModified) to nanoseconds since
+// the epoch; false when the text is not in that form.
+bool parse_iso8601_ns(const std::string& s, std::int64_t& out) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    char tail = 0;
+    if (std::sscanf(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d%c", &y, &mo, &d, &h, &mi, &se, &tail) < 6 || mo < 1 ||
+        mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 60) {
+        return false;
+    }
+    std::int64_t fraction_ns = 0;
+    if (tail == '.') {
+        const auto dot = s.find('.');
+        std::int64_t scale = 100000000;
+        for (std::size_t i = dot + 1; i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])) != 0; ++i) {
+            fraction_ns += (s[i] - '0') * scale;
+            scale /= 10;
+        }
+    }
+    // Days from 1970-01-01 to y-mo-d (proleptic Gregorian; Howard Hinnant's days_from_civil).
+    const int yy = y - (mo <= 2 ? 1 : 0);
+    const int era = (yy >= 0 ? yy : yy - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(yy - era * 400);
+    const unsigned doy = (153U * static_cast<unsigned>(mo + (mo > 2 ? -3 : 9)) + 2U) / 5U + static_cast<unsigned>(d) - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    const std::int64_t days = static_cast<std::int64_t>(era) * 146097 + static_cast<std::int64_t>(doe) - 719468;
+    out = ((days * 24 + h) * 60 + mi) * 60 + se;
+    out = out * 1000000000 + fraction_ns;
+    return true;
+}
+
 // Parses one ListObjectsV2 page: appends its objects and common prefixes and reports the continuation.
 bool parse_list_page(const std::string& xml, std::vector<ObjectInfo>& objects, std::vector<std::string>& prefixes,
                      bool& truncated, std::string& next_token, std::string& error) {
@@ -1682,7 +1712,13 @@ bool parse_list_page(const std::string& xml, std::vector<ObjectInfo>& objects, s
             error = "malformed ListObjectsV2 response (Contents)";
             return false;
         }
-        objects.push_back(ObjectInfo{xml_unescape(key), size});
+        ObjectInfo info{xml_unescape(key), size};
+        std::size_t modified_pos = 0;
+        std::string modified;
+        if (next_element(body, modified_pos, "LastModified", modified)) {
+            (void)parse_iso8601_ns(modified, info.last_modified_ns);  // unparsable: left 0, as not reported
+        }
+        objects.push_back(std::move(info));
     }
     pos = 0;
     while (next_element(xml, pos, "CommonPrefixes", body)) {
