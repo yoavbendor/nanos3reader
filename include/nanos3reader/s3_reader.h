@@ -162,6 +162,7 @@ struct DirectoryUploadStats {
 struct ObjectInfo {
     std::string key;             // full key inside the bucket (the listed prefix is included)
     std::uint64_t size = 0;
+    std::int64_t last_modified_ns = 0;  // LastModified, nanoseconds since the Unix epoch (0 when not reported)
 };
 
 // Thread-safe client for s3:// objects. One instance may be shared by any number of threads; each thread
@@ -202,6 +203,10 @@ public:
     bool put(const std::string& uri, const std::uint8_t* data, std::size_t size, const PutOptions& options,
              std::string* etag, std::string& error, bool* precondition_failed = nullptr);
 
+    // Delete one object (a DELETE). S3 answers 204 whether or not the key existed, so a missing object is
+    // success; `not_found` (when non-null) is set when the store said 404 (some S3-compatible stores do).
+    bool remove(const std::string& uri, std::string& error, bool* not_found = nullptr);
+
     // Upload a local file to `uri`, streamed from disk (never held whole in memory): one PUT below
     // options.multipart_threshold, else a multipart upload (aborted on failure, so no parts are left
     // behind). `etag` receives the object's ETag when non-null. The file must not change while it is sent;
@@ -224,6 +229,15 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// --- TLS ------------------------------------------------------------------------------------------
+
+// Where HTTPS requests take their CA certificates from, as a sentence for diagnostics (decided once per
+// process): AWS_CA_BUNDLE, CURL_CA_BUNDLE or SSL_CERT_FILE (a PEM file) and SSL_CERT_DIR (a directory),
+// when set; else, on Linux, the first system bundle found at the usual distribution paths; else the bundle
+// compiled in with the CMake option NANOS3READER_CA_BUNDLE; else libcurl's own default. Every request gets
+// these explicitly, so a statically linked libcurl/OpenSSL does not depend on the paths compiled into it.
+std::string tls_ca_source();
 
 // --- Disk-resident LRU block cache -----------------------------------------------------------------
 

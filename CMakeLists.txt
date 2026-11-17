@@ -36,8 +36,28 @@ option(NANOS3READER_BUILD_PYTHON_BINDINGS
 set(NANOS3READER_CRYPTO "openssl" CACHE STRING
     "SigV4 SHA-256 backend: openssl (default, links libcrypto) | bundled (in-tree, no crypto link)")
 
+set(NANOS3READER_CA_BUNDLE "" CACHE FILEPATH
+    "PEM CA bundle compiled into the library as the last-resort trust anchors (e.g. curl.se/ca/cacert.pem); empty: none")
+
 # --- the library --------------------------------------------------------------------------------
-add_library(nanos3reader src/s3_reader.cpp)
+# The CA bundle, compiled in when NANOS3READER_CA_BUNDLE names one (used only when no CA variable is set and no
+# system bundle is found: see tls_ca_source()), else a stub with none.
+if(NANOS3READER_CA_BUNDLE)
+    if(NOT EXISTS "${NANOS3READER_CA_BUNDLE}")
+        message(FATAL_ERROR "NANOS3READER_CA_BUNDLE: ${NANOS3READER_CA_BUNDLE} does not exist")
+    endif()
+    set(_nanos3reader_ca_cpp "${CMAKE_CURRENT_BINARY_DIR}/nanos3reader_ca_bundle.cpp")
+    add_custom_command(
+        OUTPUT "${_nanos3reader_ca_cpp}"
+        COMMAND ${CMAKE_COMMAND} -DIN=${NANOS3READER_CA_BUNDLE} -DOUT=${_nanos3reader_ca_cpp}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_ca_bundle.cmake
+        DEPENDS "${NANOS3READER_CA_BUNDLE}" ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_ca_bundle.cmake
+        COMMENT "Embedding the CA bundle ${NANOS3READER_CA_BUNDLE}")
+    message(STATUS "nanos3reader: CA bundle compiled in from ${NANOS3READER_CA_BUNDLE}")
+else()
+    set(_nanos3reader_ca_cpp "${CMAKE_CURRENT_SOURCE_DIR}/src/ca_bundle_none.cpp")
+endif()
+add_library(nanos3reader src/s3_reader.cpp ${_nanos3reader_ca_cpp})
 add_library(nanos3reader::nanos3reader ALIAS nanos3reader)
 
 target_compile_features(nanos3reader PUBLIC cxx_std_17)

@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -177,6 +178,16 @@ void client_checks(const std::string& uri, const std::string& expected, const st
         } else {
             expect_listing("list (no delimiter)", objects, want);
             if (!prefixes.empty()) fail("list (no delimiter) returned common prefixes");
+            // LastModified is reported and parsed: within a few minutes of this machine's clock.
+            const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count();
+            for (const auto& o : objects) {
+                if (o.last_modified_ns == 0 || std::llabs(now_ns - o.last_modified_ns) > 600LL * 1000000000LL) {
+                    fail("list: LastModified of " + o.key + " is " + std::to_string(o.last_modified_ns) +
+                         " ns, now is " + std::to_string(now_ns));
+                    break;
+                }
+            }
         }
     }
     // With "/": immediate children only, the sub-directory as a common prefix.
