@@ -87,7 +87,7 @@ jobs:
           NANOS3READER_IT_MISSING: s3://nanos3reader-it/data/does-not-exist.bin
           NANOS3READER_IT_LISTING: s3://nanos3reader-it/listing/
           NANOS3READER_IT_PUT_PREFIX: s3://nanos3reader-it/put/
-        run: ctest --test-dir build --output-on-failure -R minio_integration
+        run: ctest --test-dir build --output-on-failure -R "minio_integration|range_integration"
 
       - name: s3put (directory upload, same layout as Path.rglob)
         env:

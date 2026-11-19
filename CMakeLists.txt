@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nanos3reader VERSION 0.4.0 LANGUAGES CXX)
+project(nanos3reader VERSION 0.6.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------------------------------
 # nanos3reader — a minimal, read-only S3 range reader (seekable std::istream over HTTP(S) range GETs +
@@ -37,7 +37,7 @@ set(NANOS3READER_CRYPTO "openssl" CACHE STRING
     "SigV4 SHA-256 backend: openssl (default, links libcrypto) | bundled (in-tree, no crypto link)")
 
 # --- the library --------------------------------------------------------------------------------
-add_library(nanos3reader src/s3_reader.cpp)
+add_library(nanos3reader src/s3_reader.cpp src/range.cpp src/s3_range.cpp)
 add_library(nanos3reader::nanos3reader ALIAS nanos3reader)
 
 target_compile_features(nanos3reader PUBLIC cxx_std_17)
@@ -80,6 +80,11 @@ if(NANOS3READER_BUILD_TESTS)
     target_link_libraries(nanos3reader_sigv4_test PRIVATE nanos3reader::nanos3reader)
     add_test(NAME sigv4 COMMAND nanos3reader_sigv4_test)
 
+    # Offline tests of the generic range adapters (block cache, spilling writer with fake sinks).
+    add_executable(nanos3reader_range_test tests/range_test.cpp)
+    target_link_libraries(nanos3reader_range_test PRIVATE nanos3reader::nanos3reader)
+    add_test(NAME range_offline COMMAND nanos3reader_range_test)
+
     # MinIO integration test: a full end-to-end read against a live S3-compatible store. It exits 77 (and
     # CMake marks it skipped) unless NANOS3READER_IT_URI / NANOS3READER_IT_EXPECT are set in the environment.
     if(NANOS3READER_BUILD_INTEGRATION_TESTS)
@@ -88,6 +93,11 @@ if(NANOS3READER_BUILD_TESTS)
         target_link_libraries(nanos3reader_minio_test PRIVATE nanos3reader::nanos3reader Threads::Threads)
         add_test(NAME minio_integration COMMAND nanos3reader_minio_test)
         set_tests_properties(minio_integration PROPERTIES SKIP_RETURN_CODE 77)
+
+        add_executable(nanos3reader_range_integration_test tests/range_integration_test.cpp)
+        target_link_libraries(nanos3reader_range_integration_test PRIVATE nanos3reader::nanos3reader)
+        add_test(NAME range_integration COMMAND nanos3reader_range_integration_test)
+        set_tests_properties(range_integration PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()
 
