@@ -37,7 +37,10 @@ void usage() {
                  "      --part-size M            part size in MiB (default 16; at least 5)\n"
                  "      --content-type TYPE      Content-Type of every object (default application/octet-stream)\n"
                  "      --sign-payload           sign each file's SHA-256 (reads every file twice)\n"
-                 "  -q, --quiet                  no per-file lines, only the summary and failures\n");
+                 "  -q, --quiet                  no per-file lines, only the summary and failures\n"
+                 "      --tls-info               print where HTTPS takes its CA certificates from, and exit\n"
+                 "CA certificates: AWS_CA_BUNDLE, CURL_CA_BUNDLE or SSL_CERT_FILE (PEM), SSL_CERT_DIR; else the\n"
+                 "system bundle; else the one compiled in (NANOS3READER_CA_BUNDLE).\n");
 }
 
 bool parse_count(const char* text, unsigned long long& out) {
@@ -89,6 +92,10 @@ int main(int argc, char** argv) {
             options.file.sign_payload = true;
         } else if (arg == "-q" || arg == "--quiet") {
             quiet = true;
+        } else if (arg == "--tls-info") {
+            std::printf("s3put %d.%d.%d: CA certificates from %s\n", NANOS3READER_VERSION_MAJOR,
+                        NANOS3READER_VERSION_MINOR, NANOS3READER_VERSION_PATCH, nanos3reader::tls_ca_source().c_str());
+            return 0;
         } else if (arg == "-h" || arg == "--help") {
             usage();
             return 0;

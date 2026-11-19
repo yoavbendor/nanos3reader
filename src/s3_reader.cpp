@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -35,6 +36,11 @@
 #endif
 
 namespace nanos3reader {
+
+// The CA bundle compiled in with NANOS3READER_CA_BUNDLE (src/ca_bundle_none.cpp when there is none: size 0).
+const char* embedded_ca_bundle();
+std::size_t embedded_ca_bundle_size();
+
 namespace s3v4 {
 
 namespace {
@@ -317,6 +323,122 @@ std::string env_or(const char* name, const std::string& fallback) {
     return (v != nullptr && v[0] != '\0') ? std::string(v) : fallback;
 }
 
+// --- TLS trust anchors -------------------------------------------------------------------------------
+// Where the CA certificates come from, decided once per process and handed to libcurl explicitly, so a
+// statically linked libcurl/OpenSSL does not depend on the CA paths compiled into it (which a vanilla image
+// may not have). In order: AWS_CA_BUNDLE, CURL_CA_BUNDLE, SSL_CERT_FILE (a PEM file) and SSL_CERT_DIR (a
+// hashed directory); else, on Linux, the first non-empty system bundle at the usual distribution paths;
+// else the bundle compiled in with NANOS3READER_CA_BUNDLE (when there is one); else libcurl's own default.
+struct CaConfig {
+    std::string file;
+    std::string dir;
+    bool embedded = false;
+    std::string source;  // for diagnostics
+};
+
+bool non_empty_file(const std::string& path) {
+    std::error_code ec;
+    return std::filesystem::is_regular_file(path, ec) && std::filesystem::file_size(path, ec) > 0 && !ec;
+}
+
+const CaConfig& ca_config() {
+    static const CaConfig config = [] {
+        CaConfig c;
+        for (const char* var : {"AWS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"}) {
+            const std::string v = env_or(var, "");
+            if (!v.empty()) {
+                c.file = v;
+                c.source = std::string(var) + "=" + v;
+                break;
+            }
+        }
+        const std::string dir = env_or("SSL_CERT_DIR", "");
+        if (!dir.empty()) {
+            c.dir = dir;
+            c.source += (c.source.empty() ? "" : ", ") + std::string("SSL_CERT_DIR=") + dir;
+        }
+        if (!c.source.empty()) {
+            return c;
+        }
+#if defined(__linux__)
+        for (const char* path : {"/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Arch, Gentoo
+                                 "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  // RHEL / Fedora 7+
+                                 "/etc/pki/tls/certs/ca-bundle.crt",                   // RHEL / Fedora 6
+                                 "/etc/ssl/ca-bundle.pem",                             // openSUSE
+                                 "/etc/ssl/cert.pem",                                  // Alpine
+                                 "/etc/pki/tls/cacert.pem"}) {                         // OpenELEC
+            if (non_empty_file(path)) {
+                c.file = path;
+                c.source = std::string("system bundle ") + path;
+                return c;
+            }
+        }
+#endif
+        if (embedded_ca_bundle_size() != 0) {
+            c.embedded = true;
+            c.source = "the bundle compiled in (NANOS3READER_CA_BUNDLE)";
+            return c;
+        }
+        c.source = "libcurl's built-in default (none of the variables or system bundles was found)";
+        return c;
+    }();
+    return config;
+}
+
+// The compiled-in bundle as a file, for a libcurl without CURLOPT_CAINFO_BLOB (before 7.77, or a TLS backend
+// without it): written once per process to a private temporary file. Empty when it cannot be written.
+const std::string& embedded_ca_file() {
+    static const std::string path = []() -> std::string {
+        std::error_code ec;
+        const auto dir = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            return "";
+        }
+        const auto file = dir / ("nanos3reader-ca-" + std::to_string(embedded_ca_bundle_size()) + "-" +
+                                 std::to_string(static_cast<unsigned long long>(
+                                     std::chrono::steady_clock::now().time_since_epoch().count())) + ".pem");
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out.write(embedded_ca_bundle(), static_cast<std::streamsize>(embedded_ca_bundle_size()));
+        out.close();
+        return out ? file.string() : std::string();
+    }();
+    return path;
+}
+
+// Point `h` at the CA certificates (after every curl_easy_reset, which clears them).
+void apply_tls_options(CURL* h) {
+    const CaConfig& c = ca_config();
+    if (!c.file.empty()) {
+        curl_easy_setopt(h, CURLOPT_CAINFO, c.file.c_str());
+    }
+    if (!c.dir.empty()) {
+        curl_easy_setopt(h, CURLOPT_CAPATH, c.dir.c_str());
+    }
+    if (c.embedded) {
+        bool set = false;
+#if LIBCURL_VERSION_NUM >= 0x074D00  // CURLOPT_CAINFO_BLOB: curl 7.77.0
+        curl_blob blob;
+        blob.data = const_cast<char*>(embedded_ca_bundle());
+        blob.len = embedded_ca_bundle_size();
+        blob.flags = CURL_BLOB_NOCOPY;  // static storage: no copy per request
+        set = curl_easy_setopt(h, CURLOPT_CAINFO_BLOB, &blob) == CURLE_OK;
+#endif
+        if (!set && !embedded_ca_file().empty()) {
+            curl_easy_setopt(h, CURLOPT_CAINFO, embedded_ca_file().c_str());
+        }
+    }
+}
+
+// libcurl's message for `rc`, with where the CA certificates came from when TLS verification failed.
+std::string curl_error_text(CURLcode rc) {
+    std::string msg = curl_easy_strerror(rc);
+    if (rc == CURLE_PEER_FAILED_VERIFICATION || rc == CURLE_SSL_CACERT_BADFILE) {
+        msg += " (CA certificates: " + ca_config().source +
+               "; set SSL_CERT_FILE or AWS_CA_BUNDLE to a PEM bundle, or install ca-certificates)";
+    }
+    return msg;
+}
+
 std::string trim_ws(const std::string& s) {
     const auto b = s.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) {
@@ -463,6 +585,7 @@ bool http_metadata(const std::string& url, const std::vector<std::string>& heade
         hdr = curl_slist_append(hdr, h.c_str());
     }
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    apply_tls_options(c);
     if (put) {
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, "PUT");
     }
@@ -1181,6 +1304,7 @@ private:
 
             curl_easy_reset(curl_);  // preserves the live connection + DNS/TLS caches (keep-alive)
             curl_easy_setopt(curl_, CURLOPT_URL, url_.c_str());
+            apply_tls_options(curl_);
             curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L);
             curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, hdrs);
             curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, &write_to_vector);
@@ -1239,7 +1363,7 @@ private:
             }
 
             if (rc != CURLE_OK) {
-                fail(std::string("S3 GET transport error: ") + curl_easy_strerror(rc));
+                fail(std::string("S3 GET transport error: ") + curl_error_text(rc));
             } else {
                 std::string body(window_.begin(), window_.end());
                 if (body.size() > 512) {
@@ -1542,6 +1666,36 @@ std::string list_query(const std::string& prefix, const std::string& delimiter, 
     return q;
 }
 
+// ISO 8601 UTC ("2026-10-21T03:47:15.000Z", as ListObjectsV2 reports LastModified) to nanoseconds since
+// the epoch; false when the text is not in that form.
+bool parse_iso8601_ns(const std::string& s, std::int64_t& out) {
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    char tail = 0;
+    if (std::sscanf(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d%c", &y, &mo, &d, &h, &mi, &se, &tail) < 6 || mo < 1 ||
+        mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 60) {
+        return false;
+    }
+    std::int64_t fraction_ns = 0;
+    if (tail == '.') {
+        const auto dot = s.find('.');
+        std::int64_t scale = 100000000;
+        for (std::size_t i = dot + 1; i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])) != 0; ++i) {
+            fraction_ns += (s[i] - '0') * scale;
+            scale /= 10;
+        }
+    }
+    // Days from 1970-01-01 to y-mo-d (proleptic Gregorian; Howard Hinnant's days_from_civil).
+    const int yy = y - (mo <= 2 ? 1 : 0);
+    const int era = (yy >= 0 ? yy : yy - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(yy - era * 400);
+    const unsigned doy = (153U * static_cast<unsigned>(mo + (mo > 2 ? -3 : 9)) + 2U) / 5U + static_cast<unsigned>(d) - 1U;
+    const unsigned doe = yoe * 365U + yoe / 4U - yoe / 100U + doy;
+    const std::int64_t days = static_cast<std::int64_t>(era) * 146097 + static_cast<std::int64_t>(doe) - 719468;
+    out = ((days * 24 + h) * 60 + mi) * 60 + se;
+    out = out * 1000000000 + fraction_ns;
+    return true;
+}
+
 // Parses one ListObjectsV2 page: appends its objects and common prefixes and reports the continuation.
 bool parse_list_page(const std::string& xml, std::vector<ObjectInfo>& objects, std::vector<std::string>& prefixes,
                      bool& truncated, std::string& next_token, std::string& error) {
@@ -1558,7 +1712,13 @@ bool parse_list_page(const std::string& xml, std::vector<ObjectInfo>& objects, s
             error = "malformed ListObjectsV2 response (Contents)";
             return false;
         }
-        objects.push_back(ObjectInfo{xml_unescape(key), size});
+        ObjectInfo info{xml_unescape(key), size};
+        std::size_t modified_pos = 0;
+        std::string modified;
+        if (next_element(body, modified_pos, "LastModified", modified)) {
+            (void)parse_iso8601_ns(modified, info.last_modified_ns);  // unparsable: left 0, as not reported
+        }
+        objects.push_back(std::move(info));
     }
     pos = 0;
     while (next_element(xml, pos, "CommonPrefixes", body)) {
@@ -1713,6 +1873,90 @@ std::size_t capture_etag(char* buffer, std::size_t size, std::size_t nitems, voi
 // Sends `call` with SigV4 signing, retrying 5xx, 429 and transport errors that libcurl marks retriable.
 // Returns false only when no request could be made (no credentials, no handle); otherwise `reply` holds the
 // last attempt's outcome, and the caller interprets it.
+// Test-only fault injection, for the commit protocols built on this client (never set in production):
+//   NANOS3READER_FAULTS="<action>:<METHOD>:<key substring>:<n>[,...]"
+// matches requests by method and a substring of the key; <n> is the 1-based count of matching
+// attempts the rule hits ("*": every one). Actions:
+//   fail       no request is sent; the attempt fails as an unreachable host (retried as such)
+//   http500    no request is sent; the attempt answers HTTP 500 (retried as such)
+//   lost       the request is sent and the server acts on it, then the reply is dropped: the attempt
+//              fails as a timeout, so a retry sees the effect of the first one (a PUT's 412)
+//   nocond     If-None-Match / If-Match are not sent (a store that ignores conditional writes)
+// Retries are attempts too: "fail:PUT:data/:*" fails a PUT under data/ however often it is retried.
+enum class FaultAction { None, Fail, Http500, Lost, NoCond };
+
+struct FaultRule {
+    FaultAction action = FaultAction::None;
+    std::string method;
+    std::string key_part;
+    std::uint64_t nth = 0;  // 0: every matching attempt
+    std::atomic<std::uint64_t> seen{0};
+};
+
+std::vector<std::unique_ptr<FaultRule>>& fault_rules() {
+    static std::vector<std::unique_ptr<FaultRule>> rules = [] {
+        std::vector<std::unique_ptr<FaultRule>> out;
+        const char* env = std::getenv("NANOS3READER_FAULTS");
+        std::string spec = env != nullptr ? env : "";
+        std::size_t at = 0;
+        while (at < spec.size()) {
+            std::size_t end = spec.find(',', at);
+            if (end == std::string::npos) {
+                end = spec.size();
+            }
+            const std::string item = spec.substr(at, end - at);
+            at = end + 1;
+            std::vector<std::string> parts;
+            std::size_t p = 0;
+            for (int i = 0; i < 3; ++i) {
+                const std::size_t colon = item.find(':', p);
+                if (colon == std::string::npos) {
+                    break;
+                }
+                parts.push_back(item.substr(p, colon - p));
+                p = colon + 1;
+            }
+            if (parts.size() != 3) {
+                continue;
+            }
+            auto rule = std::make_unique<FaultRule>();
+            const std::string& action = parts[0];
+            rule->action = action == "fail"      ? FaultAction::Fail
+                           : action == "http500" ? FaultAction::Http500
+                           : action == "lost"    ? FaultAction::Lost
+                           : action == "nocond"  ? FaultAction::NoCond
+                                                 : FaultAction::None;
+            rule->method = parts[1];
+            rule->key_part = parts[2];
+            const std::string nth = item.substr(p);
+            rule->nth = nth == "*" ? 0U : std::strtoull(nth.c_str(), nullptr, 10);
+            if (rule->action != FaultAction::None && (nth == "*" || rule->nth > 0U)) {
+                out.push_back(std::move(rule));
+            }
+        }
+        return out;
+    }();
+    return rules;
+}
+
+/// The fault this attempt of `call` is to suffer (None when no rule matches, the usual case).
+FaultAction fault_for(const Call& call) {
+    auto& rules = fault_rules();
+    if (rules.empty()) {
+        return FaultAction::None;
+    }
+    for (auto& rule : rules) {
+        if (rule->method != call.method || call.key.find(rule->key_part) == std::string::npos) {
+            continue;
+        }
+        const std::uint64_t n = rule->seen.fetch_add(1U) + 1U;
+        if (rule->nth == 0U || n == rule->nth) {
+            return rule->action;
+        }
+    }
+    return FaultAction::None;
+}
+
 bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, const Call& call, Reply& reply,
                  std::string& error) {
     ensure_curl_global_init();
@@ -1751,6 +1995,17 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
     }
 
     for (int attempt = 0;; ++attempt) {
+        const FaultAction fault = fault_for(call);
+        if (fault == FaultAction::Fail || fault == FaultAction::Http500) {
+            reply = Reply{};
+            reply.rc = fault == FaultAction::Fail ? CURLE_COULDNT_CONNECT : CURLE_OK;
+            reply.code = fault == FaultAction::Fail ? 0 : 500;
+            if (attempt < kClientRetries) {
+                sleep_backoff(attempt + 1);
+                continue;
+            }
+            return true;
+        }
         const std::string amz_date = amz_now();  // fresh per attempt so a backoff never skews the signature
         std::vector<s3v4::Header> sign_headers = {
             {"host", ep.host},
@@ -1776,6 +2031,9 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         hdrs = curl_slist_append(hdrs, ("x-amz-date: " + amz_date).c_str());
         hdrs = curl_slist_append(hdrs, ("x-amz-content-sha256: " + payload_hash).c_str());
         for (const auto& extra : call.extra_headers) {
+            if (fault == FaultAction::NoCond && (extra.rfind("If-None-Match:", 0) == 0 || extra.rfind("If-Match:", 0) == 0)) {
+                continue;
+            }
             hdrs = curl_slist_append(hdrs, extra.c_str());
         }
         if (put || post) {
@@ -1795,6 +2053,7 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         sink.dst_cap = call.dst_cap;
         curl_easy_reset(h);
         curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        apply_tls_options(h);
         Upload upload;
         upload.data = call.body;
         upload.file = call.body_file;
@@ -1839,21 +2098,21 @@ bool run_request(const s3detail::Config& cfg, const Credentials* fixed_creds, co
         }
         curl_slist_free_all(hdrs);
 
-        reply.code = code;
-        reply.rc = rc;
+        reply.code = fault == FaultAction::Lost ? 0 : code;
+        reply.rc = fault == FaultAction::Lost ? CURLE_OPERATION_TIMEDOUT : rc;
         reply.overflow = sink.overflow;
         reply.dst_len = sink.dst_len;
         reply.content_length = static_cast<std::int64_t>(clen);
         reply.text = std::move(sink.text);
         reply.etag = std::move(etag);
 
-        const bool http_retriable = rc == CURLE_OK && (code == 429 || code == 500 || code == 502 ||
+        const bool http_retriable = reply.rc == CURLE_OK && (code == 429 || code == 500 || code == 502 ||
                                                        code == 503 || code == 504);  // 503 SlowDown included
         if (upload.failed) {
             reply.rc = CURLE_READ_ERROR;  // the local file, not the network: no retry would help
             return true;
         }
-        const bool transport_retriable = rc != CURLE_OK && !sink.overflow && is_retriable_curl(rc);
+        const bool transport_retriable = reply.rc != CURLE_OK && !sink.overflow && is_retriable_curl(reply.rc);
         if ((http_retriable || transport_retriable) && attempt < kClientRetries) {
             sleep_backoff(attempt + 1);
             continue;
@@ -1877,7 +2136,7 @@ std::string transfer_failure(const std::string& shown, const Reply& r) {
     if (r.overflow) {
         return shown + ": response body is larger than the request asked for";
     }
-    return shown + ": " + curl_easy_strerror(r.rc);
+    return shown + ": " + curl_error_text(r.rc);
 }
 
 }  // namespace
@@ -2141,6 +2400,45 @@ bool S3Client::put(const std::string& uri, const std::uint8_t* data, std::size_t
     }
     if (etag != nullptr) {
         *etag = r.etag;
+    }
+    return true;
+}
+
+bool S3Client::remove(const std::string& uri, std::string& error, bool* not_found) {
+    error.clear();
+    if (not_found != nullptr) {
+        *not_found = false;
+    }
+    std::string bucket;
+    std::string key;
+    if (!split_s3_uri(uri, true, bucket, key, error)) {
+        return false;
+    }
+    if (!impl_->refusal.empty()) {
+        error = uri + ": " + impl_->refusal;
+        return false;
+    }
+    Call call;
+    call.method = "DELETE";
+    call.bucket = bucket;
+    call.key = key;
+    Reply r;
+    if (!run_request(impl_->cfg, impl_->has_fixed_creds ? &impl_->fixed_creds : nullptr, call, r, error)) {
+        return false;
+    }
+    if (r.overflow || r.rc != CURLE_OK) {
+        error = transfer_failure(uri, r);
+        return false;
+    }
+    if (r.code == 404) {
+        if (not_found != nullptr) {
+            *not_found = true;
+        }
+        return true;
+    }
+    if (r.code != 204 && r.code != 200) {
+        error = http_failure(uri, r);
+        return false;
     }
     return true;
 }
@@ -2550,5 +2848,11 @@ bool S3Client::put_directory(const std::string& dir, const std::string& prefix_u
     }
     return true;
 }
+
+}  // namespace nanos3reader
+
+namespace nanos3reader {
+
+std::string tls_ca_source() { return ca_config().source; }
 
 }  // namespace nanos3reader
