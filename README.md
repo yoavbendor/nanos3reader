@@ -133,6 +133,34 @@ following symlinks to files and not symlinked directories (as Python's `Path.rgl
 `sign_payload` to sign each file's SHA-256 instead. A failed multipart upload is aborted, so no parts are
 left behind, and a file that changes size while it is sent fails rather than leaving a short object.
 
+## Range source and spilling writer
+
+Two adapters for code that reads and writes objects at offsets, such as a columnar file reader or a table
+format's writer. Both are storage-agnostic in `range.h`; the S3 bindings are in `s3_range.h`.
+
+```cpp
+#include "nanos3reader/s3_range.h"
+
+auto client = std::make_shared<nanos3reader::S3Client>();
+
+// Read: one HEAD for the size, then range GETs. Small reads share one cached 1 MiB block; the footer is
+// fetched in one 64 KiB request. Reads are absolute offsets, so one source serves any reader in any order.
+std::string error;
+auto src = nanos3reader::open_s3_range_source(client, "s3://bucket/data/file.parquet", error);
+std::uint8_t footer[8];
+src->read_at(src->size() - 8, 8, footer, error);
+
+// Write: bytes are held in memory up to 8 MiB, then spilled to a temporary file. Nothing is visible until
+// commit(), which is one PUT (memory) or a multipart upload (file). A writer destroyed without commit() publishes
+// nothing and removes its temporary file.
+auto w = nanos3reader::open_s3_writer(client, "s3://bucket/out/file.parquet");
+*w << "...";  // any std::ostream output; tellp() counts the bytes
+w->commit(error);
+```
+
+The block cache (`BlockCachedSource`) is not thread-safe: use one source per reader. The writer is an
+`std::ostream` that never seeks back. `ObjectSink` lets you supply the upload for tests or other stores.
+
 ### `s3put`
 
 The same as a command (built with the library; `NANOS3READER_BUILD_TOOLS`):
