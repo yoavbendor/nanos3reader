@@ -37,6 +37,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://localhost:9000
+      AWS_ALLOW_HTTP: "true"  # moto serves plain HTTP; the client refuses an http:// endpoint otherwise
       BUCKET: nanos3reader-it
     steps:
       - uses: actions/checkout@v4
@@ -119,6 +120,7 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://localhost:9000
+      AWS_ALLOW_HTTP: "true"  # moto serves plain HTTP; the client refuses an http:// endpoint otherwise
       BUCKET: nanos3reader-it
     steps:
       - uses: actions/checkout@v4
